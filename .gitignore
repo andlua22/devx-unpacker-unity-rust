@@ -1,0 +1,68 @@
+# Rust / Cargo build artifacts
+target/
+**/*.rs.bk
+*.pdb
+*.profraw
+*.profdata
+
+# Generated Bevy sandbox, exports, and local APK/game test inputs
+/bevy_zero_game/
+/export/
+/test/
+
+# Proprietary third-party RE reference & downloaded local CLI tools
+/DevXUnity_11.10_Decrypted/
+/.tools/
+
+# Local AI assistant skills, working memory & agent state
+/.agents/
+/memory/
+/.gemini/
+
+# Binary packages, Unity bundles & extracted media artifacts
+*.apk
+*.aab
+*.xapk
+*.ipa
+*.obb
+*.unitypackage
+*.assetbundle
+*.ab
+*.assets
+*.resS
+*.resource
+*.glb
+*.gltf
+*.fbx
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Reverse-engineering databases (IDA Pro / Ghidra)
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.gpr
+*.rep/
+
+# Logs, environment variables & signing keys
+*.log
+.env
+.env.*
+*.jks
+*.keystore
+*.p12
+
+# OS & IDE files
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.vscode/
+.idea/

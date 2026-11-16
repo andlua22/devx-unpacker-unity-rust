@@ -1,0 +1,27 @@
+[package]
+name = "devx-codecs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+devx-plugin-api = { path = "../devx-plugin-api" }
+devx-unity-io = { path = "../devx-unity-io" }
+flate2.workspace = true
+fsbex.workspace = true
+gltf-json.workspace = true
+hound.workspace = true
+image.workspace = true
+indexmap.workspace = true
+lz4_flex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+symphonia.workspace = true
+texture2ddecoder.workspace = true
+thiserror.workspace = true
+unity-asset-binary.workspace = true
+unity-asset-core.workspace = true
+unity-asset-decode.workspace = true

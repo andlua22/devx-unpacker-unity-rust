@@ -1,0 +1,16 @@
+{
+  "code": "COMMAND_NOT_FOUND",
+  "message": "'inspect-native-exports' is not a command for 'rea'. Did you mean 'inspect-native-api'?",
+  "cta": {
+    "description": "Suggested commands:",
+    "commands": [
+      {
+        "command": "rea inspect-native-api /home/andlua/Project/DevX/DevXUnity_11.10_Decrypted/Library/imagecompress-x64.dll --json"
+      },
+      {
+        "command": "rea --help",
+        "description": "see all available commands"
+      }
+    ]
+  }
+}

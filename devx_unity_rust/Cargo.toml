@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/devx-plugin-api",
+    "crates/devx-unity-io",
+    "crates/devx-core",
+    "crates/devx-codecs",
+    "crates/devx-scripts",
+    "crates/devx-exporter",
+    "crates/devx-plugins-builtin",
+    "crates/devx-app",
+]
+exclude = ["vendor/il2cpp_dumper"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["DevX Unity Rust Contributors"]
+repository = "https://github.com/example/devx_unity_rust"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+brotli = "9.1.1"
+capstone = "0.14.0"
+crossbeam = "0.8.5"
+eframe = { version = "0.37.0", default-features = true, features = ["persistence", "glow"] }
+egui = "0.37.0"
+egui_extras = { version = "0.37.0", features = ["syntect", "image"] }
+egui_tiles = "0.18.0"
+flate2 = "1.1.11"
+fsbex = "0.3.0"
+gltf-json = { version = "1.4.1", features = ["names"] }
+hound = "3.5.1"
+image = { version = "0.25.10", default-features = false, features = ["png", "dds", "tga", "bmp", "jpeg", "webp"] }
+indexmap = "2.14.2"
+lz4_flex = "0.14.0"
+memmap2 = "0.9.12"
+parking_lot = "0.13.0"
+rabex = "0.2.1"
+rayon = "1.12.0"
+rfd = "0.18.0"
+rodio = { version = "0.23.0", default-features = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.154"
+serde_yaml = "0.9.34"
+symphonia = { version = "0.6.1", features = ["all"] }
+tar = "0.4.46"
+texture2ddecoder = "0.1.2"
+thiserror = "2.0.21"
+tracing = "0.1"
+unity-asset = "0.2.0"
+unity-asset-binary = "0.2.0"
+unity-asset-core = "0.2.0"
+unity-asset-decode = { version = "0.2.0", features = ["full"] }
+unity-asset-yaml = "0.2.0"
+walkdir = "2.5.0"
+zip = { version = "9.5.1", default-features = false, features = ["deflate", "zstd", "lzma", "bzip2"] }

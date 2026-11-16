@@ -1,0 +1,29 @@
+[package]
+name = "devx-exporter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+devx-codecs = { path = "../devx-codecs" }
+devx-core = { path = "../devx-core" }
+devx-plugin-api = { path = "../devx-plugin-api" }
+devx-plugins-builtin = { path = "../devx-plugins-builtin" }
+devx-scripts = { path = "../devx-scripts" }
+devx-unity-io = { path = "../devx-unity-io" }
+flate2.workspace = true
+image.workspace = true
+indexmap.workspace = true
+rabex.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+unity-asset-binary.workspace = true
+unity-asset-core.workspace = true
+unity-asset-yaml.workspace = true
