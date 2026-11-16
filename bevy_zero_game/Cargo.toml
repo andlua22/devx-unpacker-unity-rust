@@ -1,0 +1,12 @@
+[package]
+name = "bevy_zero_game"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.20.1", features = ["wav", "symphonia-wav", "mp3", "vorbis", "system_font_discovery"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.dev.package."*"]
+opt-level = 2

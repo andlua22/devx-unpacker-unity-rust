@@ -1,3 +1,5 @@
+assets/
+
 # Rust / Cargo build artifacts
 target/
 **/*.rs.bk
@@ -6,7 +8,6 @@ target/
 *.profdata
 
 # Generated Bevy sandbox, exports, and local APK/game test inputs
-/bevy_zero_game/
 /export/
 /test/
 
