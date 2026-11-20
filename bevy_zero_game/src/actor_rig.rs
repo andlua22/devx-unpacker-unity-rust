@@ -1,7 +1,10 @@
 //! Shared 3D character rig selection, glTF animation binding, and right-hand weapon socket
 //! helpers shared across [`crate::lobby`], [`crate::ingame`], and [`crate::sandbox`].
 
+use std::collections::HashMap;
 use std::time::Duration;
+
+use bevy::animation::{AnimatedBy, AnimationTargetId};
 
 use bevy::gltf::Gltf;
 use bevy::prelude::*;
@@ -53,7 +56,9 @@ pub fn pick_clip_for_state(
         return None;
     }
     let patterns: &[&str] = match anim_state {
-        AnimState::Attack => &["attack", "fire", "shoot", "slash", "strike", "gj", "hit", "skill"],
+        AnimState::Attack => &[
+            "attack", "fire", "shoot", "slash", "strike", "gj", "hit", "skill",
+        ],
         AnimState::Jump => &["jump", "tiao", "leap", "air"],
         AnimState::Run => &["run", "sprint", "dash", "pao", "jog"],
         AnimState::Walk => &["walk", "move", "zou"],
@@ -81,8 +86,10 @@ pub fn pick_clip_for_state(
     {
         return Some(hit);
     }
-    if matches!(anim_state, AnimState::Attack | AnimState::Jump | AnimState::Walk)
-        && let Some(hit) = pick_clip_for_state(AnimState::Idle, nodes)
+    if matches!(
+        anim_state,
+        AnimState::Attack | AnimState::Jump | AnimState::Walk
+    ) && let Some(hit) = pick_clip_for_state(AnimState::Idle, nodes)
     {
         return Some(hit);
     }
@@ -177,7 +184,10 @@ pub fn find_hand_socket_entity(
         if let Ok(name) = names_q.get(e) {
             let low = name.as_str().to_ascii_lowercase();
             // Never mount a new weapon onto an already-spawned weapon mesh subtree.
-            if low.starts_with("ingameweapon_") || low.starts_with("lobbyweapon_") {
+            if low.starts_with("ingameweapon_")
+                || low.starts_with("lobbyweapon_")
+                || low == "charpart_hair"
+            {
                 continue;
             }
             for (rank, pat) in SOCKET_PATTERNS.iter().enumerate() {
@@ -325,10 +335,7 @@ pub fn selectable_weapon_prop_indices(manifest: &AssetManifest) -> Vec<usize> {
 }
 
 /// Selects the equipped handheld weapon/tool GLB from `manifest.props`.
-pub fn select_weapon_prop(
-    manifest: &AssetManifest,
-    prop_idx: usize,
-) -> Option<&GlbAssetEntry> {
+pub fn select_weapon_prop(manifest: &AssetManifest, prop_idx: usize) -> Option<&GlbAssetEntry> {
     if let Some(direct) = manifest.props.get(prop_idx)
         && is_equippable_weapon(direct)
     {
@@ -430,6 +437,76 @@ pub fn select_character_part_by_equip_id<'a>(
         .find(|c| c.name.eq_ignore_ascii_case(stem))
 }
 
+/// Loaded body source used to bind the native clips and locate the authoritative skeleton.
+#[derive(Component)]
+pub struct CharacterBodyGltf {
+    pub gltf: Handle<Gltf>,
+    pub label: String,
+}
+
+/// A rigid hair scene retains its exported head bind transform instead of receiving skin animation.
+#[derive(Component)]
+pub struct RigidCharacterHair;
+
+#[derive(Component)]
+pub struct BoundRigidCharacterHair;
+
+fn spawn_character_parts(
+    parent: &mut ChildSpawnerCommands,
+    asset_server: &AssetServer,
+    parts: [(&'static str, CharacterPartTintKind, Option<&GlbAssetEntry>); 6],
+) {
+    for (label, tint_kind, entry) in parts {
+        let Some(entry) = entry else {
+            continue;
+        };
+        let mut part = parent.spawn((
+            WorldAssetRoot(asset_server.load(format!("{}#Scene0", entry.asset_path))),
+            Name::new(label),
+            tint_kind,
+        ));
+        if label == "CharPart_Body" {
+            part.insert(CharacterBodyGltf {
+                gltf: asset_server.load(entry.asset_path.clone()),
+                label: entry.name.clone(),
+            });
+        } else if label == "CharPart_Hair" && entry.skin_count == 0 {
+            part.insert(RigidCharacterHair);
+        }
+    }
+}
+
+/// Resolves starter clothes from the selected native preset before falling back to showcase variants.
+pub fn select_character_body_from_profile<'a>(
+    manifest: &'a AssetManifest,
+    configs: &GameConfigs,
+    profile: &PlayerProfileSave,
+) -> Option<&'a GlbAssetEntry> {
+    select_preset_equipment(manifest, configs, profile, |role| &role.clothes)
+        .or_else(|| select_character_body(manifest, profile.sex_male, profile.body_variant_idx))
+}
+
+fn select_preset_equipment<'a>(
+    manifest: &'a AssetManifest,
+    configs: &GameConfigs,
+    profile: &PlayerProfileSave,
+    equipment_ids: impl Fn(&crate::config::EstablishRoleEntry) -> &[i32],
+) -> Option<&'a GlbAssetEntry> {
+    let role = configs
+        .establish_roles
+        .iter()
+        .find(|role| role.id == profile.role_preset_id && role.sex == profile.sex_male)
+        .or_else(|| {
+            configs
+                .establish_roles
+                .iter()
+                .find(|role| role.sex == profile.sex_male)
+        })?;
+    equipment_ids(role).iter().find_map(|&id| {
+        select_character_part_by_equip_id(manifest, &configs.equip_cfgs, profile.sex_male, id)
+    })
+}
+
 /// Spawns all 5 modular character GLBs (`body`, `head`, `gloves`, `shoes`, `hair`) under `parent`
 /// so all `Bip001` parts align on the same skeleton root cleanly.
 pub fn spawn_modular_character(
@@ -453,22 +530,18 @@ pub fn spawn_modular_character(
         None
     };
 
-    for (label, tint_kind, opt_entry) in [
-        ("CharPart_Body", CharacterPartTintKind::Cloth, body),
-        ("CharPart_Trousers", CharacterPartTintKind::Cloth, trousers),
-        ("CharPart_Head", CharacterPartTintKind::Skin, head),
-        ("CharPart_Gloves", CharacterPartTintKind::Skin, gloves),
-        ("CharPart_Shoes", CharacterPartTintKind::Cloth, shoes),
-        ("CharPart_Hair", CharacterPartTintKind::Hair, hair),
-    ] {
-        if let Some(entry) = opt_entry {
-            parent.spawn((
-                WorldAssetRoot(asset_server.load(format!("{}#Scene0", entry.asset_path))),
-                Name::new(label),
-                tint_kind,
-            ));
-        }
-    }
+    spawn_character_parts(
+        parent,
+        asset_server,
+        [
+            ("CharPart_Body", CharacterPartTintKind::Cloth, body),
+            ("CharPart_Trousers", CharacterPartTintKind::Cloth, trousers),
+            ("CharPart_Head", CharacterPartTintKind::Skin, head),
+            ("CharPart_Gloves", CharacterPartTintKind::Skin, gloves),
+            ("CharPart_Shoes", CharacterPartTintKind::Cloth, shoes),
+            ("CharPart_Hair", CharacterPartTintKind::Hair, hair),
+        ],
+    );
 }
 
 /// Spawns modular character parts resolving `EstablishRole` + `EquipCfg` IDs from `profile`,
@@ -481,7 +554,7 @@ pub fn spawn_modular_character_from_profile(
     profile: &PlayerProfileSave,
 ) {
     let sex_male = profile.sex_male;
-    let body = select_character_body(manifest, sex_male, profile.body_variant_idx);
+    let body = select_character_body_from_profile(manifest, configs, profile);
     let head = select_character_part_by_equip_id(
         manifest,
         &configs.equip_cfgs,
@@ -496,29 +569,239 @@ pub fn spawn_modular_character_from_profile(
         profile.head_item_id,
     )
     .or_else(|| select_character_hair(manifest, sex_male, profile.hair_variant_idx));
-    let gloves = select_character_gloves(manifest, sex_male, profile.body_variant_idx);
-    let shoes = select_character_shoes(manifest, sex_male, profile.body_variant_idx);
+    let gloves = select_preset_equipment(manifest, configs, profile, |role| &role.glove)
+        .or_else(|| select_character_gloves(manifest, sex_male, profile.body_variant_idx));
+    let shoes = select_preset_equipment(manifest, configs, profile, |role| &role.shoes)
+        .or_else(|| select_character_shoes(manifest, sex_male, profile.body_variant_idx));
     let need_trousers = body.is_some_and(|b| !b.name.to_ascii_lowercase().contains("liantifu"));
     let trousers = if need_trousers {
-        select_character_trousers(manifest, sex_male, profile.body_variant_idx)
+        select_preset_equipment(manifest, configs, profile, |role| &role.pants)
+            .or_else(|| select_character_trousers(manifest, sex_male, profile.body_variant_idx))
     } else {
         None
     };
 
-    for (label, tint_kind, opt_entry) in [
-        ("CharPart_Body", CharacterPartTintKind::Cloth, body),
-        ("CharPart_Trousers", CharacterPartTintKind::Cloth, trousers),
-        ("CharPart_Head", CharacterPartTintKind::Skin, head),
-        ("CharPart_Gloves", CharacterPartTintKind::Skin, gloves),
-        ("CharPart_Shoes", CharacterPartTintKind::Cloth, shoes),
-        ("CharPart_Hair", CharacterPartTintKind::Hair, hair),
-    ] {
-        if let Some(entry) = opt_entry {
-            parent.spawn((
-                WorldAssetRoot(asset_server.load(format!("{}#Scene0", entry.asset_path))),
-                Name::new(label),
-                tint_kind,
-            ));
+    spawn_character_parts(
+        parent,
+        asset_server,
+        [
+            ("CharPart_Body", CharacterPartTintKind::Cloth, body),
+            ("CharPart_Trousers", CharacterPartTintKind::Cloth, trousers),
+            ("CharPart_Head", CharacterPartTintKind::Skin, head),
+            ("CharPart_Gloves", CharacterPartTintKind::Skin, gloves),
+            ("CharPart_Shoes", CharacterPartTintKind::Cloth, shoes),
+            ("CharPart_Hair", CharacterPartTintKind::Hair, hair),
+        ],
+    );
+}
+
+/// Mounts unskinned hair on the body head while preserving its source bind-space geometry.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn bind_rigid_character_hair(
+    mut commands: Commands,
+    hair_parts: Query<
+        (Entity, &ChildOf),
+        (With<RigidCharacterHair>, Without<BoundRigidCharacterHair>),
+    >,
+    bodies: Query<(), With<CharacterBodyGltf>>,
+    children: Query<&Children>,
+    names: Query<&Name>,
+    transforms: Query<&Transform>,
+    parents: Query<&ChildOf>,
+) {
+    for (hair, parent) in &hair_parts {
+        let Ok(actor_parts) = children.get(parent.parent()) else {
+            continue;
+        };
+        let Some(body) = actor_parts.iter().find(|&entity| bodies.contains(entity)) else {
+            continue;
+        };
+        let Some(body_head) = find_named_descendant(body, "Bip001 Head", &children, &names) else {
+            continue;
+        };
+        let Some(hair_head) = find_named_descendant(hair, "Bip001 Head", &children, &names) else {
+            continue;
+        };
+        let Some(bind) = transform_relative_to_root(hair_head, hair, &transforms, &parents) else {
+            continue;
+        };
+        commands.entity(hair).insert((
+            ChildOf(body_head),
+            Transform::from_matrix(bind.inverse()),
+            BoundRigidCharacterHair,
+        ));
+    }
+}
+
+pub fn find_named_descendant(
+    root: Entity,
+    name: &str,
+    children: &Query<&Children>,
+    names: &Query<&Name>,
+) -> Option<Entity> {
+    let mut stack = vec![root];
+    while let Some(entity) = stack.pop() {
+        if names.get(entity).is_ok_and(|found| found.as_str() == name) {
+            return Some(entity);
+        }
+        if let Ok(children) = children.get(entity) {
+            stack.extend(children.iter());
+        }
+    }
+    None
+}
+
+fn transform_relative_to_root(
+    mut entity: Entity,
+    root: Entity,
+    transforms: &Query<&Transform>,
+    parents: &Query<&ChildOf>,
+) -> Option<Mat4> {
+    let mut relative = Mat4::IDENTITY;
+    loop {
+        if entity == root {
+            return Some(relative);
+        }
+        relative = transforms.get(entity).ok()?.to_matrix() * relative;
+        entity = parents.get(entity).ok()?.parent();
+    }
+}
+
+/// One native body player and its target IDs, shared by the matching modular skeletons.
+#[derive(Component)]
+pub struct CharacterBodyAnimation {
+    pub player: Entity,
+    pub targets: std::collections::HashMap<String, bevy::animation::AnimationTargetId>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn bind_native_character_animations(
+    mut commands: Commands,
+    parents: Query<&ChildOf>,
+    bodies: Query<(&CharacterBodyGltf, &ChildOf)>,
+    actors: Query<(), With<CharacterAnimDriver>>,
+    children: Query<&Children>,
+    targets: Query<(&Name, &AnimationTargetId)>,
+    gltfs: Res<Assets<Gltf>>,
+    mut graphs: ResMut<Assets<AnimationGraph>>,
+    mut players: Query<(Entity, &mut AnimationPlayer), Without<AnimationGraphHandle>>,
+) {
+    for (player_entity, mut player) in &mut players {
+        let mut cursor = player_entity;
+        let mut body = None;
+        loop {
+            if let Ok((source, parent)) = bodies.get(cursor) {
+                if actors.contains(parent.parent()) {
+                    body = Some((cursor, source));
+                }
+                break;
+            }
+            let Ok(parent) = parents.get(cursor) else {
+                break;
+            };
+            cursor = parent.parent();
+        }
+        let Some((body_entity, source)) = body else {
+            continue;
+        };
+        let Some(gltf) = gltfs.get(&source.gltf) else {
+            continue;
+        };
+        let Some(bundle) = build_gltf_animation_set(
+            gltf,
+            &source.label,
+            BoundActorRole::Player,
+            AnimState::Idle,
+            0,
+            0.0,
+            false,
+            &mut player,
+            &mut graphs,
+        ) else {
+            continue;
+        };
+        commands.entity(player_entity).insert(bundle);
+        if let Ok(parent) = parents.get(body_entity) {
+            commands.entity(parent.parent()).insert(UsesBakedGltfAnim);
+        }
+        let mut bone_targets = HashMap::new();
+        let mut stack = vec![body_entity];
+        while let Some(entity) = stack.pop() {
+            if let Ok((name, id)) = targets.get(entity)
+                && name.as_str().starts_with("Bip001")
+            {
+                bone_targets.insert(name.as_str().to_owned(), *id);
+            }
+            if let Ok(children) = children.get(entity) {
+                stack.extend(children.iter());
+            }
+        }
+        commands.entity(body_entity).insert(CharacterBodyAnimation {
+            player: player_entity,
+            targets: bone_targets,
+        });
+    }
+}
+
+pub fn retarget_native_character_parts(
+    mut commands: Commands,
+    bodies: Query<(Entity, &ChildOf, &CharacterBodyAnimation)>,
+    children: Query<&Children>,
+    names: Query<&Name>,
+    rigid_hair: Query<(), With<RigidCharacterHair>>,
+    animated: Query<(&AnimationTargetId, &AnimatedBy)>,
+) {
+    for (body, parent, binding) in &bodies {
+        let Ok(parts) = children.get(parent.parent()) else {
+            continue;
+        };
+        let mut stack: Vec<Entity> = parts.iter().filter(|&entity| entity != body).collect();
+        while let Some(entity) = stack.pop() {
+            if rigid_hair.contains(entity) {
+                continue;
+            }
+            if let Ok(name) = names.get(entity)
+                && let Some(&id) = binding.targets.get(name.as_str())
+                && animated
+                    .get(entity)
+                    .ok()
+                    .is_none_or(|(old_id, player)| *old_id != id || player.0 != binding.player)
+            {
+                commands
+                    .entity(entity)
+                    .insert((id, AnimatedBy(binding.player)));
+            }
+            if let Ok(children) = children.get(entity) {
+                stack.extend(children.iter());
+            }
+        }
+    }
+}
+
+/// Drives native clip transitions for any modular actor, including preloaded battle avatars.
+pub fn drive_native_character_animations(
+    actors: Query<&CharacterAnimDriver>,
+    bodies: Query<(&ChildOf, &CharacterBodyAnimation)>,
+    mut players: Query<(
+        &mut AnimationPlayer,
+        &mut AnimationTransitions,
+        &BoundAnimationSet,
+    )>,
+) {
+    for (parent, binding) in &bodies {
+        let Ok(driver) = actors.get(parent.parent()) else {
+            continue;
+        };
+        let Ok((mut player, mut transitions, set)) = players.get_mut(binding.player) else {
+            continue;
+        };
+        let Some((_, clip)) = pick_clip_for_state(driver.state, &set.nodes) else {
+            continue;
+        };
+        if !player.is_playing_animation(clip) {
+            transitions
+                .play(&mut player, clip, Duration::from_millis(180))
+                .repeat();
         }
     }
 }
@@ -590,9 +873,10 @@ pub fn apply_character_skin_and_hair_tints(
                 cloned.base_color = mixed;
                 mat_h.0 = materials.add(cloned);
                 if orig_opt.is_none() {
-                    commands
-                        .entity(mesh_e)
-                        .insert((OriginalMaterialBaseColor(base), AppliedTintSignature(target_id)));
+                    commands.entity(mesh_e).insert((
+                        OriginalMaterialBaseColor(base),
+                        AppliedTintSignature(target_id),
+                    ));
                 } else {
                     commands
                         .entity(mesh_e)
@@ -768,7 +1052,8 @@ pub fn animate_bip001_rigs(
 
         // Shoulder-to-shoulder outward direction never changes when arms rotate, making late-loaded
         // modular glove/shoe GLBs compute the identical tuck axis as the body rig.
-        let (l_tuck_axis_root, r_tuck_axis_root) = if let (Some(lu), Some(ru)) = (l_upper, r_upper) {
+        let (l_tuck_axis_root, r_tuck_axis_root) = if let (Some(lu), Some(ru)) = (l_upper, r_upper)
+        {
             let left_out = (lu - ru).with_y(0.0).normalize_or(-right_root);
             let lt_ax = left_out.cross(Vec3::NEG_Y).normalize_or(fwd_root);
             let rt_ax = (-left_out).cross(Vec3::NEG_Y).normalize_or(-fwd_root);
@@ -824,12 +1109,20 @@ fn sample_bip_angles(driver: CharacterAnimDriver, role: BipBoneRole) -> (f32, f3
     match driver.state {
         AnimState::Idle => match role {
             BipBoneRole::LUpperArm => (
-                if driver.has_weapon { 0.28 } else { 0.05 + 0.025 * s },
+                if driver.has_weapon {
+                    0.28
+                } else {
+                    0.05 + 0.025 * s
+                },
                 0.84,
             ),
             BipBoneRole::LForearm => (if driver.has_weapon { 0.56 } else { 0.30 }, 0.0),
             BipBoneRole::RUpperArm => (
-                if driver.has_weapon { 0.46 + 0.02 * s } else { 0.05 - 0.025 * s },
+                if driver.has_weapon {
+                    0.46 + 0.02 * s
+                } else {
+                    0.05 - 0.025 * s
+                },
                 0.80,
             ),
             BipBoneRole::RForearm => (if driver.has_weapon { 0.68 } else { 0.28 }, 0.0),
@@ -839,32 +1132,62 @@ fn sample_bip_angles(driver: CharacterAnimDriver, role: BipBoneRole) -> (f32, f3
             BipBoneRole::Spine1 => (-0.04 - 0.02 * s, 0.0),
         },
         AnimState::Walk | AnimState::Run => {
-            let amp = if driver.state == AnimState::Run { 0.56 } else { 0.34 };
+            let amp = if driver.state == AnimState::Run {
+                0.56
+            } else {
+                0.34
+            };
             let leg_l = amp * s;
             let leg_r = -amp * s;
             match role {
                 BipBoneRole::LThigh => (leg_l, 0.0),
-                BipBoneRole::LCalf => (-(leg_l.max(0.0) * 0.55 + (-leg_l).max(0.0) * 0.85) - 0.08, 0.0),
+                BipBoneRole::LCalf => (
+                    -(leg_l.max(0.0) * 0.55 + (-leg_l).max(0.0) * 0.85) - 0.08,
+                    0.0,
+                ),
                 BipBoneRole::RThigh => (leg_r, 0.0),
-                BipBoneRole::RCalf => (-(leg_r.max(0.0) * 0.55 + (-leg_r).max(0.0) * 0.85) - 0.08, 0.0),
+                BipBoneRole::RCalf => (
+                    -(leg_r.max(0.0) * 0.55 + (-leg_r).max(0.0) * 0.85) - 0.08,
+                    0.0,
+                ),
                 BipBoneRole::LUpperArm => (
-                    if driver.has_weapon { 0.30 - 0.14 * s } else { -amp * 0.72 * s + 0.06 },
+                    if driver.has_weapon {
+                        0.30 - 0.14 * s
+                    } else {
+                        -amp * 0.72 * s + 0.06
+                    },
                     0.66,
                 ),
                 BipBoneRole::LForearm => (
-                    if driver.has_weapon { 0.60 } else { 0.36 + 0.15 * (-s).max(0.0) },
+                    if driver.has_weapon {
+                        0.60
+                    } else {
+                        0.36 + 0.15 * (-s).max(0.0)
+                    },
                     0.0,
                 ),
                 BipBoneRole::RUpperArm => (
-                    if driver.has_weapon { 0.48 + 0.06 * s } else { amp * 0.72 * s + 0.06 },
+                    if driver.has_weapon {
+                        0.48 + 0.06 * s
+                    } else {
+                        amp * 0.72 * s + 0.06
+                    },
                     0.64,
                 ),
                 BipBoneRole::RForearm => (
-                    if driver.has_weapon { 0.72 } else { 0.36 + 0.15 * s.max(0.0) },
+                    if driver.has_weapon {
+                        0.72
+                    } else {
+                        0.36 + 0.15 * s.max(0.0)
+                    },
                     0.0,
                 ),
                 BipBoneRole::Spine1 => (
-                    if driver.state == AnimState::Run { -0.14 } else { -0.06 },
+                    if driver.state == AnimState::Run {
+                        -0.14
+                    } else {
+                        -0.06
+                    },
                     0.0,
                 ),
             }
@@ -882,11 +1205,19 @@ fn sample_bip_angles(driver: CharacterAnimDriver, role: BipBoneRole) -> (f32, f3
             BipBoneRole::LUpperArm => (0.32 - 0.15 * s, 0.64),
             BipBoneRole::LForearm => (0.58, 0.0),
             BipBoneRole::RUpperArm => (
-                if driver.has_weapon { 0.56 + 0.16 * s } else { 0.84 + 0.52 * s },
+                if driver.has_weapon {
+                    0.56 + 0.16 * s
+                } else {
+                    0.84 + 0.52 * s
+                },
                 0.56,
             ),
             BipBoneRole::RForearm => (
-                if driver.has_weapon { 0.78 - 0.10 * s } else { 0.45 + 0.25 * s },
+                if driver.has_weapon {
+                    0.78 - 0.10 * s
+                } else {
+                    0.45 + 0.25 * s
+                },
                 0.0,
             ),
             BipBoneRole::LThigh => (0.14, 0.0),
@@ -894,5 +1225,125 @@ fn sample_bip_angles(driver: CharacterAnimDriver, role: BipBoneRole) -> (f32, f3
             BipBoneRole::LCalf | BipBoneRole::RCalf => (-0.12, 0.0),
             BipBoneRole::Spine1 => (-0.12 - 0.05 * s, 0.0),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{DecodedOcFile, EstablishRoleEntry};
+
+    #[test]
+    fn native_presets_resolve_their_starter_clothing_equipment() {
+        let manifest: AssetManifest =
+            serde_json::from_str(include_str!("../assets/manifest.json")).unwrap();
+        let roles: DecodedOcFile<EstablishRoleEntry> =
+            serde_json::from_str(include_str!("../assets/config/cfg.EstablishRole.json")).unwrap();
+        let equipment: DecodedOcFile<EquipCfgEntry> =
+            serde_json::from_str(include_str!("../assets/config/cfg.EquipCfg.json")).unwrap();
+        let configs = GameConfigs {
+            establish_roles: roles.records,
+            equip_cfgs: equipment.records,
+            ..default()
+        };
+        assert_eq!(configs.establish_roles.len(), 16);
+        for role in &configs.establish_roles {
+            let profile = PlayerProfileSave {
+                role_preset_id: role.id,
+                sex_male: role.sex,
+                body_variant_idx: 7,
+                ..default()
+            };
+            let (prefix, suffix) = if role.sex {
+                ("man", "01")
+            } else {
+                ("woman", "02")
+            };
+            for (part, selected) in [
+                (
+                    "clothes",
+                    select_character_body_from_profile(&manifest, &configs, &profile),
+                ),
+                (
+                    "trousers",
+                    select_preset_equipment(&manifest, &configs, &profile, |r| &r.pants),
+                ),
+                (
+                    "shoes",
+                    select_preset_equipment(&manifest, &configs, &profile, |r| &r.shoes),
+                ),
+                (
+                    "glove",
+                    select_preset_equipment(&manifest, &configs, &profile, |r| &r.glove),
+                ),
+            ] {
+                assert_eq!(
+                    selected.map(|entry| entry.name.as_str()),
+                    Some(format!("{prefix}_{part}_chushijuese_{suffix}").as_str()),
+                    "preset {} {part}",
+                    role.id,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rigid_hair_keeps_bind_alignment_and_follows_the_body_head() {
+        let mut app = App::new();
+        app.add_systems(Update, bind_rigid_character_hair);
+        let actor = app.world_mut().spawn(Transform::IDENTITY).id();
+        let body = app
+            .world_mut()
+            .spawn((
+                CharacterBodyGltf {
+                    gltf: Handle::default(),
+                    label: "body".into(),
+                },
+                Transform::IDENTITY,
+                ChildOf(actor),
+            ))
+            .id();
+        let head_bind =
+            Transform::from_xyz(0.03, 1.66, -0.04).with_rotation(Quat::from_rotation_z(0.13));
+        let body_head = app
+            .world_mut()
+            .spawn((Name::new("Bip001 Head"), head_bind, ChildOf(body)))
+            .id();
+        let hair = app
+            .world_mut()
+            .spawn((RigidCharacterHair, Transform::IDENTITY, ChildOf(actor)))
+            .id();
+        app.world_mut()
+            .spawn((Name::new("Bip001 Head"), head_bind, ChildOf(hair)));
+        let renderer_bind =
+            Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2));
+        app.world_mut().spawn((renderer_bind, ChildOf(hair)));
+        app.update();
+        assert_eq!(
+            app.world().get::<ChildOf>(hair).unwrap().parent(),
+            body_head
+        );
+        assert!(app.world().get::<BoundRigidCharacterHair>(hair).is_some());
+        let attached = *app.world().get::<Transform>(hair).unwrap();
+        let actual = head_bind.to_matrix() * attached.to_matrix() * renderer_bind.to_matrix();
+        for (actual, expected) in actual
+            .to_cols_array()
+            .into_iter()
+            .zip(renderer_bind.to_matrix().to_cols_array())
+        {
+            assert!((actual - expected).abs() < 0.00001);
+        }
+        let animated_head =
+            head_bind.with_translation(head_bind.translation + Vec3::new(0.1, 0.0, 0.2));
+        let vertex = Vec3::new(0.02, 0.08, 1.75);
+        let before = renderer_bind.to_matrix().transform_point3(vertex);
+        let after = (animated_head.to_matrix() * attached.to_matrix() * renderer_bind.to_matrix())
+            .transform_point3(vertex);
+        assert!(after.abs_diff_eq(before + Vec3::new(0.1, 0.0, 0.2), 0.00001));
+        app.update();
+        assert_eq!(
+            app.world().get::<ChildOf>(hair).unwrap().parent(),
+            body_head
+        );
     }
 }

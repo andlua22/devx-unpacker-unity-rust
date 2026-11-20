@@ -5962,24 +5962,22 @@ impl<'a> MethodCtx<'a> {
                             _ => false,
                         };
                         if is_shuffle {
-                            // A copy OF A VOID CALL's result has no value to
-                            // carry. The call's own statement already ran, and
-                            // this copy is the SSA joiner for the ABI return
-                            // register — `CollectWeeklyFacebookGift` @0x47014C
-                            // ends in a TAIL call to a void method and the
-                            // joiner rendered `v23 = …SetLastWeekFacebookGiftWasCollected(…)`,
-                            // a second copy of the one native `b`. The method's
-                            // own return type decides: for a void method the
-                            // native `b` simply discards the value.
-                            if self.ret_is_void {
-                                if let Some(sv) = src.as_local() {
-                                    if self.reaching_def_at(sv, i).is_some_and(|d| {
-                                        Self::call_result_is_void(&self.insns[d])
-                                            && self.call_site_statement_emitted(d)
-                                    }) {
-                                        return vec![];
-                                    }
-                                }
+                            // A proven void callee supplies no value for an
+                            // ABI return-register copy. Its own statement
+                            // already represents the native call, regardless
+                            // of this method's return type. Chase SSA aliases:
+                            // bool `CreateCoroutine.MoveNext` @0x209D528 copied
+                            // AddItemToBag's x0 into a branch-edge local and
+                            // otherwise emitted that one call twice.
+                            if src
+                                .as_local()
+                                .and_then(|sv| self.chase_reaching_def(sv, i))
+                                .is_some_and(|d| {
+                                    Self::call_result_is_void(&self.insns[d])
+                                        && self.call_site_statement_emitted(d)
+                                })
+                            {
+                                return vec![];
                             }
                             let needs_copy = d
                                 .as_ref()

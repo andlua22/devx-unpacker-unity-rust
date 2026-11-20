@@ -1775,7 +1775,12 @@ fn eval_ui_track_scalar(times: &[f32], values: &[f32], t: f32) -> f32 {
     values[i0] + (values[i1] - values[i0]) * f
 }
 
-fn sample_ui_anim_for_path(clips: &[DecodedUiAnimationClip], path: &str, t: f32) -> SampledUiNodeAnim {
+fn sample_ui_anim_for_path(
+    clips: &[DecodedUiAnimationClip],
+    path: &str,
+    t: f32,
+    node: &UiCanvasNode,
+) -> SampledUiNodeAnim {
     let mut out = SampledUiNodeAnim {
         dx: 0.0,
         dy: 0.0,
@@ -1799,17 +1804,67 @@ fn sample_ui_anim_for_path(clips: &[DecodedUiAnimationClip], path: &str, t: f32)
         }
         let v = eval_ui_track_scalar(&tr.times, &tr.values, clip_t);
         match tr.channel {
-            UiAnimChannel::AnchoredPosX => out.dx += v,
-            UiAnimChannel::AnchoredPosY => out.dy -= v,
-            UiAnimChannel::LocalEulerZDeg => out.rot_z_deg = -v,
-            UiAnimChannel::LocalScaleX => out.sx = v,
-            UiAnimChannel::LocalScaleY => out.sy = v,
+            // Native curves contain absolute local property values. Convert to differences
+            // from the solved prefab before mapping them through its parent's canvas basis.
+            UiAnimChannel::AnchoredPosX => out.dx = v - node.anchored_position[0],
+            UiAnimChannel::AnchoredPosY => out.dy = v - node.anchored_position[1],
+            UiAnimChannel::LocalEulerZDeg => out.rot_z_deg = -v - node.rotation_z_deg,
+            UiAnimChannel::LocalScaleX => out.sx = if node.scale[0].abs() > 1e-5 { v / node.scale[0] } else { 1.0 },
+            UiAnimChannel::LocalScaleY => out.sy = if node.scale[1].abs() > 1e-5 { v / node.scale[1] } else { 1.0 },
             UiAnimChannel::ColorAlpha => out.alpha = Some(v.clamp(0.0, 1.0)),
             UiAnimChannel::Active => out.active = Some(v >= 0.5),
             UiAnimChannel::SizeDeltaX | UiAnimChannel::SizeDeltaY => {}
         }
     }
     out
+}
+
+struct UiNodePaintGeometry {
+    bounds: Rect,
+    artwork: Rect,
+    rotation_deg: f32,
+    flip_x: bool,
+    flip_y: bool,
+}
+
+fn ui_node_paint_geometry(node: &UiCanvasNode, anim: SampledUiNodeAnim) -> UiNodePaintGeometry {
+    let rect = |[x, y, w, h]: [f32; 4]| Rect::from_min_size(pos2(x, y), vec2(w, h));
+    let mut bounds = rect(node.canvas_rect);
+    // The bounds are for picking and clipping. Rotating their dimensions again distorts
+    // non-square artwork; the exporter retains the original axis lengths separately.
+    let mut artwork = rect(node.canvas_render_rect.unwrap_or(node.canvas_rect));
+    let base_rotation = node.canvas_rotation_z_deg.unwrap_or(node.rotation_z_deg);
+    let [bx, by] = node.canvas_parent_basis.unwrap_or([[1.0, 0.0], [0.0, -1.0]]);
+    let translation = vec2(bx[0] * anim.dx + by[0] * anim.dy, bx[1] * anim.dx + by[1] * anim.dy);
+    // A reflected parent reverses the direction of a local rotation in screen space.
+    let rotation_sign = if bx[0] * by[1] - bx[1] * by[0] > 0.0 { -1.0 } else { 1.0 };
+    let rotation_deg = base_rotation + rotation_sign * anim.rot_z_deg;
+    if (anim.sx - 1.0).abs() > 1e-3 || (anim.sy - 1.0).abs() > 1e-3 || anim.rot_z_deg.abs() > 0.01 {
+        let pivot_offset = vec2(
+            artwork.width() * (node.pivot[0] - 0.5) * if node.flip_x { -1.0 } else { 1.0 },
+            artwork.height() * (0.5 - node.pivot[1]) * if node.flip_y { -1.0 } else { 1.0 },
+        );
+        let pivot = artwork.center() + rotate_ui_vector(pivot_offset, base_rotation);
+        let center = pivot - rotate_ui_vector(vec2(pivot_offset.x * anim.sx, pivot_offset.y * anim.sy), rotation_deg);
+        artwork = Rect::from_center_size(center, vec2(artwork.width() * anim.sx.abs(), artwork.height() * anim.sy.abs()));
+        let (sin, cos) = rotation_deg.to_radians().sin_cos();
+        bounds = Rect::from_center_size(center, vec2(
+            artwork.width() * cos.abs() + artwork.height() * sin.abs(),
+            artwork.width() * sin.abs() + artwork.height() * cos.abs(),
+        ));
+    }
+    UiNodePaintGeometry {
+        bounds: bounds.translate(translation),
+        artwork: artwork.translate(translation),
+        rotation_deg,
+        flip_x: node.flip_x ^ (anim.sx < 0.0),
+        flip_y: node.flip_y ^ (anim.sy < 0.0),
+    }
+}
+
+fn rotate_ui_vector(delta: egui::Vec2, rotation_deg: f32) -> egui::Vec2 {
+    let (sin, cos) = rotation_deg.to_radians().sin_cos();
+    vec2(delta.x * cos - delta.y * sin, delta.x * sin + delta.y * cos)
 }
 
 struct UiNodeHit {
@@ -1866,45 +1921,33 @@ fn paint_ui_node_recursive(
     ctx: &UiPaintCtx<'_>,
     hits: &mut Vec<UiNodeHit>,
 ) {
-    let anim = sample_ui_anim_for_path(ctx.animations, path, ctx.anim_time);
+    let anim = sample_ui_anim_for_path(ctx.animations, path, ctx.anim_time, node);
     let node_active = anim.active.unwrap_or(node.active_in_hierarchy);
     if !ctx.show_inactive && !node_active {
         return;
     }
 
-    let [mut rx, mut ry, mut rw, mut rh] = if (node.canvas_rect[2] < 1.0 || node.canvas_rect[3] < 1.0)
+    let geometry = ui_node_paint_geometry(node, anim);
+    let mut bounds = geometry.bounds;
+    if (node.canvas_rect[2] < 1.0 || node.canvas_rect[3] < 1.0)
         && node.is_interactive
         && node.graphic.is_none()
+        && let Some([x, y, w, h]) = union_active_child_canvas_rect(node)
     {
-        union_active_child_canvas_rect(node).unwrap_or(node.canvas_rect)
-    } else {
-        node.canvas_rect
-    };
-    if anim.dx.abs() > 0.01 || anim.dy.abs() > 0.01 {
-        rx += anim.dx;
-        ry += anim.dy;
+        bounds = Rect::from_min_size(pos2(x, y), vec2(w, h));
     }
-    if (anim.sx - 1.0).abs() > 1e-3 || (anim.sy - 1.0).abs() > 1e-3 {
-        let cx = rx + rw * node.pivot[0];
-        let cy = ry + rh * (1.0 - node.pivot[1]);
-        rw = (rw * anim.sx.abs()).max(0.0);
-        rh = (rh * anim.sy.abs()).max(0.0);
-        rx = cx - rw * node.pivot[0];
-        ry = cy - rh * (1.0 - node.pivot[1]);
-    }
-    let screen_min = pos2(ctx.frame_min.x + rx * ctx.scale, ctx.frame_min.y + ry * ctx.scale);
-    let screen_rect = Rect::from_min_size(screen_min, vec2(rw * ctx.scale, rh * ctx.scale));
+    let to_screen = |rect: Rect| Rect::from_min_size(
+        ctx.frame_min + rect.min.to_vec2() * ctx.scale,
+        rect.size() * ctx.scale,
+    );
+    let screen_rect = to_screen(bounds);
+    let artwork_rect = to_screen(geometry.artwork);
+    let [rx, ry, rw, rh] = [bounds.min.x, bounds.min.y, bounds.width(), bounds.height()];
     let eff_alpha = if node_active {
         anim.alpha.unwrap_or(node.effective_alpha)
     } else {
         (node.effective_alpha * 0.35).max(0.15)
     };
-    let leaf_rot_deg = if node.children.is_empty() {
-        node.rotation_z_deg + anim.rot_z_deg
-    } else {
-        anim.rot_z_deg
-    };
-
     let draw_graphic = node.graphic_enabled && (!node.clips_children || node.show_mask_graphic);
     if draw_graphic && let Some(ref g) = node.graphic {
         match g {
@@ -1920,7 +1963,7 @@ fn paint_ui_node_recursive(
             } => {
                 paint_ui_image(
                     painter,
-                    screen_rect,
+                    artwork_rect,
                     *color,
                     eff_alpha,
                     texture_key.as_deref().and_then(|k| ctx.textures.get(k)),
@@ -1930,12 +1973,12 @@ fn paint_ui_node_recursive(
                     *fill_amount,
                     *border,
                     [0.0, 0.0, 1.0, 1.0],
-                    node.flip_x,
-                    node.flip_y,
+                    geometry.flip_x,
+                    geometry.flip_y,
                     false,
                     raw_name.as_deref().or(Some(node.name.as_str())),
                     ctx.scale,
-                    leaf_rot_deg,
+                    geometry.rotation_deg,
                 );
             }
             UiGraphic::RawImage {
@@ -1947,7 +1990,7 @@ fn paint_ui_node_recursive(
             } => {
                 paint_ui_image(
                     painter,
-                    screen_rect,
+                    artwork_rect,
                     *color,
                     eff_alpha,
                     texture_key.as_deref().and_then(|k| ctx.textures.get(k)),
@@ -1957,12 +2000,12 @@ fn paint_ui_node_recursive(
                     1.0,
                     [0.0; 4],
                     *uv_rect,
-                    node.flip_x,
-                    node.flip_y,
+                    geometry.flip_x,
+                    geometry.flip_y,
                     true,
                     raw_name.as_deref().or(Some(node.name.as_str())),
                     ctx.scale,
-                    leaf_rot_deg,
+                    geometry.rotation_deg,
                 );
             }
             UiGraphic::Text {
@@ -1977,7 +2020,7 @@ fn paint_ui_node_recursive(
                 if ctx.show_labels && !text.is_empty() {
                     paint_ui_text(
                         painter,
-                        screen_rect,
+                        artwork_rect,
                         text,
                         *color,
                         eff_alpha,
@@ -1985,6 +2028,7 @@ fn paint_ui_node_recursive(
                         *alignment,
                         *rich_text,
                         *outline_color,
+                        geometry.rotation_deg,
                     );
                 }
             }
@@ -2060,6 +2104,8 @@ fn paint_ui_node_recursive(
         && node.children.iter().any(|c| c.name == "Off" && c.active_self);
     let radio_default_on = !node.name.to_ascii_lowercase().contains("female");
 
+    // Ancestor transforms are baked into static canvas geometry. Animated parent transforms
+    // still need a separate relayout pass before they can affect descendant geometry here.
     for child in &node.children {
         if hide_toggle_checkmark
             && matches!(child.name.as_str(), "Checkmark" | "m_mark" | "m_select")
@@ -2201,7 +2247,7 @@ fn paint_ui_image(
         && tex_sz.y > 1.0
         && border.iter().any(|&b| b > 0.5)
     {
-        paint_9_sliced_image(painter, tex.id(), tex_sz, draw_rect, border, scale, tint);
+        paint_9_sliced_image(painter, tex.id(), tex_sz, draw_rect, border, scale, tint, rot_deg);
         return;
     }
 
@@ -2216,25 +2262,29 @@ fn paint_ui_image(
         (v_top_unity, v_bot_unity)
     };
     let uv = Rect::from_min_max(pos2(u0, v0), pos2(u1, v1));
+    paint_ui_image_quad(painter, tex.id(), draw_rect, uv, tint, rect.center(), rot_deg);
+}
+
+fn paint_ui_image_quad(
+    painter: &egui::Painter,
+    tex_id: egui::TextureId,
+    rect: Rect,
+    uv: Rect,
+    tint: Color32,
+    rotation_center: Pos2,
+    rot_deg: f32,
+) {
     if rot_deg.abs() > 0.25 {
-        let mut mesh = egui::Mesh::with_texture(tex.id());
-        let c = draw_rect.center();
-        let rad = rot_deg.to_radians();
-        let (sin_r, cos_r) = rad.sin_cos();
-        let rotate_pt = |p: Pos2| -> Pos2 {
-            let dx = p.x - c.x;
-            let dy = p.y - c.y;
-            pos2(c.x + dx * cos_r - dy * sin_r, c.y + dx * sin_r + dy * cos_r)
-        };
+        let mut mesh = egui::Mesh::with_texture(tex_id);
         let corners = [
-            (draw_rect.left_top(), pos2(uv.min.x, uv.min.y)),
-            (draw_rect.right_top(), pos2(uv.max.x, uv.min.y)),
-            (draw_rect.right_bottom(), pos2(uv.max.x, uv.max.y)),
-            (draw_rect.left_bottom(), pos2(uv.min.x, uv.max.y)),
+            (rect.left_top(), pos2(uv.min.x, uv.min.y)),
+            (rect.right_top(), pos2(uv.max.x, uv.min.y)),
+            (rect.right_bottom(), pos2(uv.max.x, uv.max.y)),
+            (rect.left_bottom(), pos2(uv.min.x, uv.max.y)),
         ];
         for (p, t) in corners {
             mesh.vertices.push(egui::epaint::Vertex {
-                pos: rotate_pt(p),
+                pos: rotation_center + rotate_ui_vector(p - rotation_center, rot_deg),
                 uv: t,
                 color: tint,
             });
@@ -2242,10 +2292,11 @@ fn paint_ui_image(
         mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         painter.add(egui::Shape::mesh(mesh));
     } else {
-        painter.image(tex.id(), draw_rect, uv, tint);
+        painter.image(tex_id, rect, uv, tint);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_9_sliced_image(
     painter: &egui::Painter,
     tex_id: egui::TextureId,
@@ -2254,6 +2305,7 @@ fn paint_9_sliced_image(
     border_px: [f32; 4], // [left, top, right, bottom] in sprite pixels
     scale: f32,
     tint: Color32,
+    rot_deg: f32,
 ) {
     let bl = (border_px[0] * scale).min(dst.width() * 0.5);
     let bt = (border_px[1] * scale).min(dst.height() * 0.5);
@@ -2280,7 +2332,7 @@ fn paint_9_sliced_image(
             }
             let r = Rect::from_min_max(pos2(xs[col], ys[row]), pos2(xs[col + 1], ys[row + 1]));
             let uv = Rect::from_min_max(pos2(us[col], vs[row]), pos2(us[col + 1], vs[row + 1]));
-            painter.image(tex_id, r, uv, tint);
+            paint_ui_image_quad(painter, tex_id, r, uv, tint, dst.center(), rot_deg);
         }
     }
 }
@@ -2296,6 +2348,7 @@ fn paint_ui_text(
     alignment: UiTextAlignment,
     rich_text: bool,
     outline_color: Option<[f32; 4]>,
+    rotation_deg: f32,
 ) {
     let alpha = (color[3] * effective_alpha).clamp(0.0, 1.0);
     if alpha <= 0.004 || rect.width() < 2.0 || rect.height() < 2.0 {
@@ -2336,7 +2389,20 @@ fn paint_ui_text(
         rect.min.y + rect.height() * alignment.vertical_factor(),
     );
 
-    let clip = painter.with_clip_rect(painter.clip_rect().intersect(rect.expand(8.0)));
+    let (sin, cos) = rotation_deg.to_radians().sin_cos();
+    let text_bounds = Rect::from_center_size(rect.center(), vec2(
+        rect.width() * cos.abs() + rect.height() * sin.abs(),
+        rect.width() * sin.abs() + rect.height() * cos.abs(),
+    ));
+    let clip = painter.with_clip_rect(painter.clip_rect().intersect(text_bounds.expand(8.0)));
+    let galley = clip.layout_no_wrap(display.to_owned(), font_id, fg);
+    let origin = egui_align.anchor_size(anchor, galley.size()).min;
+    let paint_text = |offset: egui::Vec2, tint: Color32| {
+        let rotated_origin = rect.center() + rotate_ui_vector(origin + offset - rect.center(), rotation_deg);
+        clip.add(egui::epaint::TextShape::new(rotated_origin, galley.clone(), tint)
+            .with_override_text_color(tint)
+            .with_angle(rotation_deg.to_radians()));
+    };
     if let Some(oc) = outline_color {
         let oa = (oc[3] * effective_alpha * 255.0).round() as u8;
         if oa > 4 {
@@ -2346,10 +2412,10 @@ fn paint_ui_text(
                 (oc[2] * 255.0).round() as u8,
                 oa,
             );
-            clip.text(anchor + vec2(1.0, 1.0), egui_align, display, font_id.clone(), shadow);
+            paint_text(vec2(1.0, 1.0), shadow);
         }
     }
-    clip.text(anchor, egui_align, display, font_id, fg);
+    paint_text(egui::Vec2::ZERO, fg);
 }
 
 fn strip_unity_rich_text(input: &str) -> String {
@@ -4112,4 +4178,105 @@ fn render_animator_transition(
         summary.push_str(&conds.join(" && "));
     }
     ui.monospace(summary);
+}
+
+#[cfg(test)]
+mod ui_affine_preview_tests {
+    use super::*;
+    use devx_codecs::animation::DecodedUiAnimTrack;
+
+    fn clip(channels: &[(UiAnimChannel, f32)]) -> DecodedUiAnimationClip {
+        DecodedUiAnimationClip {
+            name: "native-property-values".to_owned(),
+            duration_secs: 1.0,
+            sample_rate: 60.0,
+            wrap_mode: 0,
+            tracks: channels.iter().map(|&(channel, value)| DecodedUiAnimTrack {
+                path_hash: 0,
+                path_name: Some(String::new()),
+                channel,
+                times: vec![0.0],
+                values: vec![value],
+            }).collect(),
+        }
+    }
+
+    fn assert_rect_near(actual: Rect, expected: [f32; 4]) {
+        for (actual, expected) in [actual.min.x, actual.min.y, actual.width(), actual.height()]
+            .into_iter().zip(expected)
+        {
+            assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
+        }
+    }
+
+    #[test]
+    fn non_square_artwork_keeps_axis_lengths_and_cumulative_rotation() {
+        let node = UiCanvasNode {
+            canvas_rect: [530.0, 360.0, 20.0, 40.0],
+            canvas_render_rect: Some([520.0, 370.0, 40.0, 20.0]),
+            rotation_z_deg: 0.0,
+            canvas_rotation_z_deg: Some(-90.0),
+            ..Default::default()
+        };
+        let geometry = ui_node_paint_geometry(&node, sample_ui_anim_for_path(&[], "", 0.0, &node));
+        assert_rect_near(geometry.bounds, [530.0, 360.0, 20.0, 40.0]);
+        assert_rect_near(geometry.artwork, [520.0, 370.0, 40.0, 20.0]);
+        assert_eq!(geometry.rotation_deg, -90.0);
+        assert!(!geometry.flip_x && !geometry.flip_y);
+    }
+
+    #[test]
+    fn counter_rotated_footer_graphic_with_children_stays_upright() {
+        let node = UiCanvasNode {
+            canvas_rect: [477.0, 950.0, 887.0, 45.0],
+            canvas_render_rect: Some([477.0, 950.0, 887.0, 45.0]),
+            rotation_z_deg: -180.0,
+            canvas_rotation_z_deg: Some(0.0),
+            children: vec![UiCanvasNode::default()],
+            ..Default::default()
+        };
+        let geometry = ui_node_paint_geometry(&node, sample_ui_anim_for_path(&[], "", 0.0, &node));
+        assert_eq!(geometry.rotation_deg, 0.0);
+        assert_rect_near(geometry.bounds, [477.0, 950.0, 887.0, 45.0]);
+    }
+
+    #[test]
+    fn anchored_animation_uses_absolute_values_and_inverted_parent_basis() {
+        let node = UiCanvasNode {
+            canvas_rect: [100.0, 200.0, 80.0, 20.0],
+            anchored_position: [10.0, -217.0],
+            scale: [2.0, 1.0, 1.0],
+            canvas_rotation_z_deg: Some(0.0),
+            canvas_parent_basis: Some([[-1.0, 0.0], [0.0, 1.0]]),
+            ..Default::default()
+        };
+        let native = clip(&[
+            (UiAnimChannel::AnchoredPosX, 10.0),
+            (UiAnimChannel::AnchoredPosY, -153.0),
+            (UiAnimChannel::LocalScaleX, 2.0),
+        ]);
+        let geometry = ui_node_paint_geometry(&node, sample_ui_anim_for_path(&[native], "", 0.0, &node));
+        assert_rect_near(geometry.bounds, [100.0, 264.0, 80.0, 20.0]);
+        assert_rect_near(geometry.artwork, [100.0, 264.0, 80.0, 20.0]);
+    }
+
+    #[test]
+    fn animated_rotation_keeps_native_pivot_and_parent_handedness() {
+        let node = UiCanvasNode {
+            canvas_rect: [100.0, 100.0, 40.0, 20.0],
+            pivot: [0.0, 1.0],
+            canvas_rotation_z_deg: Some(0.0),
+            ..Default::default()
+        };
+        let native = clip(&[(UiAnimChannel::LocalEulerZDeg, 90.0)]);
+        let anim = sample_ui_anim_for_path(&[native], "", 0.0, &node);
+        let geometry = ui_node_paint_geometry(&node, anim);
+        assert_rect_near(geometry.bounds, [100.0, 60.0, 20.0, 40.0]);
+        assert_eq!(geometry.rotation_deg, -90.0);
+        let reflected = UiCanvasNode {
+            canvas_parent_basis: Some([[-1.0, 0.0], [0.0, -1.0]]),
+            ..node
+        };
+        assert_eq!(ui_node_paint_geometry(&reflected, anim).rotation_deg, 90.0);
+    }
 }

@@ -1,0 +1,58 @@
+v50 = IL2CPP_InitMetadata(void*.ptr_0x476d570);
+if (this.<>1__state == 1)
+{
+	*(int*)(this.<curInfo>5__3 -32) = -1;
+	if (this.<curInfo>5__3 == 0) return v147;
+	this.<curInfo>5__3.createNum = this.<curInfo>5__3.createNum - 1;
+	if (this.<createInfo>5__4 == 0) return v147;
+	if (this.<>4__this == 0) return v147;
+	this.<>4__this.AddItemToBag(this.<createInfo>5__4.targetItemId, this.<createInfo>5__4.productNum);
+	instance = this.<>4__this.AddItemToBag(this.<createInfo>5__4.targetItemId, this.<createInfo>5__4.productNum);
+	if (this.<curInfo>5__3 == 0) return v147;
+	if (!(this.<curInfo>5__3.createNum > 0))
+	{
+		if (this.<createInfos>5__2 != 0)
+		{
+			this.<createInfos>5__2.RemoveAt(0);
+			this.<>4__this._createList.handle();
+		}
+	}
+	*(nint*)(this.<curInfo>5__3) = 0;
+	*(nint*)(this.<curInfo>5__3 +8) = 0;
+	v20 = this.<createInfos>5__2;
+	if (this.<createInfos>5__2 != 0)
+	{
+		L3:
+		if (*(nint*)(v20 +24) <= 0)
+		{
+			this.<>4__this._mCreateCoroutine = 0;
+			v21 = 0;
+		} else {
+			this.<curInfo>5__3 = v20[0];
+			if (v20[0] == 0) return v147;
+			v122 = DrawingCfg.Get(*(nint*)(v20[0] +16));
+			this.<createInfo>5__4 = v122;
+			if (v122 != 0)
+			{
+				this.<>2__current = Utils.WaitForSeconds(__abi);
+				this.<>1__state = 1;
+				return true;
+			}
+			throw new NullReferenceException("Object reference not set to an instance of an object.");
+		}
+		return v21;
+	}
+} else if (this.<>1__state != 0) {
+	return false;
+} else {
+	this.<>1__state = -1;
+	this.<createInfos>5__2 = this.<>4__this._createList.ceateInfos;
+	v20 = this.<>4__this._createList.ceateInfos;
+	if (this.<>4__this._createList.ceateInfos != 0)
+	{
+		goto L3;
+	} else {
+		return v147;
+	}
+}
+return v147;

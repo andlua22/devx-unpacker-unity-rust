@@ -33,7 +33,7 @@ egui_extras = { version = "0.37.0", features = ["syntect", "image"] }
 egui_tiles = "0.18.0"
 flate2 = "1.1.11"
 fsbex = "0.3.0"
-gltf-json = { version = "1.4.1", features = ["names"] }
+gltf-json = { version = "1.4.1", features = ["names", "extras"] }
 hound = "3.5.1"
 image = { version = "0.25.10", default-features = false, features = ["png", "dds", "tga", "bmp", "jpeg", "webp"] }
 indexmap = "2.14.2"

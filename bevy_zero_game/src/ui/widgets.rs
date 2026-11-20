@@ -55,6 +55,8 @@ pub struct UiTextInput {
     pub value: String,
     pub placeholder: String,
     pub max_len: usize,
+    /// Unity InputField characterLimit counts C# UTF-16 code units.
+    pub count_utf16_units: bool,
     pub is_password: bool,
     pub focused: bool,
     pub submit_on_enter: bool,
@@ -70,6 +72,7 @@ impl Default for UiTextInput {
             value: String::new(),
             placeholder: "Enter text...".to_owned(),
             max_len: 32,
+            count_utf16_units: false,
             is_password: false,
             focused: false,
             submit_on_enter: true,
@@ -89,6 +92,10 @@ pub struct UiTextInputChanged {
     pub value: String,
     pub submitted: bool,
 }
+
+/// Original Unity Placeholder object, retaining its exported text, font, color and rectangle.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct UiTextInputPlaceholder(pub Entity);
 
 /// Pure-Bevy continuous horizontal slider (`Slider` equivalent).
 #[derive(Component, Clone, Debug)]
@@ -151,7 +158,7 @@ pub struct UiToggleChanged {
     pub active: bool,
 }
 
-/// Scrollable vertical viewport container (`ScrollRect` equivalent).
+/// Scrollable viewport container; enabled axes come from `Node::overflow`.
 #[derive(Component, Clone, Copy, Debug, Default)]
 pub struct UiScrollArea {
     pub speed_px: f32,
@@ -223,26 +230,7 @@ pub fn attach_slider_observers(ec: &mut EntityCommands) {
 }
 
 /// Attaches click toggle behavior to a [`UiToggle`] entity.
-pub fn attach_toggle_observer(ec: &mut EntityCommands) {
-    ec.insert((
-        Button,
-        Hovered::default(),
-        observe(
-            |activate: On<Activate>,
-             mut toggles: Query<&mut UiToggle>,
-             mut out: MessageWriter<UiToggleChanged>| {
-                if let Ok(mut tog) = toggles.get_mut(activate.entity) {
-                    tog.active = !tog.active;
-                    out.write(UiToggleChanged {
-                        entity: activate.entity,
-                        tag: tog.tag.clone(),
-                        active: tog.active,
-                    });
-                }
-            },
-        ),
-    ));
-}
+
 
 fn apply_slider_pointer(
     entity: Entity,
@@ -307,94 +295,7 @@ pub fn sync_one_slider_visuals(
 
 /// Spawns a complete Pure-Bevy styled slider widget bar inside a parent UI container.
 #[allow(clippy::too_many_arguments)]
-pub fn spawn_clean_slider(
-    parent: &mut ChildSpawnerCommands,
-    tag: impl Into<String>,
-    min: f32,
-    max: f32,
-    value: f32,
-    width: Val,
-    height: Val,
-    fill_color: Color,
-    track_tex: Option<Handle<Image>>,
-    fill_tex: Option<Handle<Image>>,
-) -> Entity {
-    let pct = if (max - min).abs() > 1e-5 {
-        ((value - min) / (max - min)).clamp(0.0, 1.0) * 100.0
-    } else {
-        0.0
-    };
 
-    let mut fill_entity = None;
-    let mut handle_entity = None;
-    let mut track_ec = parent.spawn((
-        Node {
-            width,
-            height,
-            position_type: PositionType::Relative,
-            border: UiRect::all(Val::Px(1.0)),
-            border_radius: BorderRadius::all(Val::Px(4.0)),
-            overflow: Overflow::clip(),
-            justify_content: JustifyContent::FlexStart,
-            align_items: AlignItems::Center,
-            ..default()
-        },
-        BackgroundColor(Color::srgba(0.08, 0.11, 0.17, 0.92)),
-        BorderColor::all(Color::srgba(0.38, 0.54, 0.78, 0.85)),
-    ));
-    if let Some(t_tex) = track_tex {
-        track_ec.insert(ImageNode::new(t_tex));
-    }
-    track_ec.with_children(|track| {
-        let mut fe = track.spawn((
-            Pickable::IGNORE,
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(0.0),
-                top: Val::Px(0.0),
-                width: Val::Percent(pct),
-                height: Val::Percent(100.0),
-                ..default()
-            },
-            BackgroundColor(fill_color),
-        ));
-        if let Some(f_tex) = fill_tex {
-            fe.insert(ImageNode::new(f_tex).with_color(fill_color));
-        }
-        fill_entity = Some(fe.id());
-
-        let he = track
-            .spawn((
-                Pickable::IGNORE,
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Percent(pct),
-                    top: Val::Px(-1.0),
-                    width: Val::Px(12.0),
-                    height: Val::Percent(110.0),
-                    margin: UiRect::left(Val::Px(-6.0)),
-                    border_radius: BorderRadius::all(Val::Px(3.0)),
-                    border: UiRect::all(Val::Px(1.0)),
-                    ..default()
-                },
-                BackgroundColor(Color::srgb(0.95, 0.96, 0.99)),
-                BorderColor::all(Color::srgb(0.20, 0.30, 0.45)),
-            ))
-            .id();
-        handle_entity = Some(he);
-    });
-    track_ec.insert(UiSlider {
-        tag: tag.into(),
-        min,
-        max,
-        value: value.clamp(min.min(max), min.max(max)),
-        fill_entity,
-        handle_entity,
-        label_entity: None,
-    });
-    attach_slider_observers(&mut track_ec);
-    track_ec.id()
-}
 
 type SelectableColorsItem<'w> = (
     &'w Hovered,
@@ -435,7 +336,7 @@ fn style_selectable_colors(mut q: Query<SelectableColorsItem, With<Button>>) {
     }
 }
 
-fn handle_text_input_typing(
+pub(crate) fn handle_text_input_typing(
     mut focus: ResMut<InputFocus>,
     mut key_events: MessageReader<KeyboardInput>,
     mut inputs: Query<(Entity, &mut UiTextInput)>,
@@ -508,8 +409,12 @@ fn push_char_if_fits(
     entity: Entity,
     out: &mut MessageWriter<UiTextInputChanged>,
 ) {
-    let char_count = inp.value.chars().count();
-    if char_count >= inp.max_len.max(1) {
+    let (char_count, added) = if inp.count_utf16_units {
+        (inp.value.encode_utf16().count(), ch.len_utf16())
+    } else {
+        (inp.value.chars().count(), 1)
+    };
+    if char_count.saturating_add(added) > inp.max_len.max(1) {
         return;
     }
     inp.value.push(ch);
@@ -521,12 +426,34 @@ fn push_char_if_fits(
     });
 }
 
+#[derive(bevy::ecs::query::QueryData)]
+#[query_data(mutable)]
+struct TextInputVisuals {
+    input: &'static UiTextInput,
+    border: Option<&'static mut BorderColor>,
+    placeholder: Option<&'static UiTextInputPlaceholder>,
+}
+
 fn sync_text_input_visuals(
-    mut inputs: Query<(&UiTextInput, Option<&mut BorderColor>), Changed<UiTextInput>>,
+    mut inputs: Query<TextInputVisuals, Changed<UiTextInput>>,
     mut texts: Query<(&mut Text, &mut TextColor)>,
+    mut placeholders: Query<(&mut Visibility, &mut Node)>,
 ) {
-    for (inp, border_opt) in &mut inputs {
-        if let Some(mut bc) = border_opt {
+    for visuals in &mut inputs {
+        let inp = visuals.input;
+        let placeholder = visuals.placeholder;
+        if let Some(placeholder) = placeholder
+            && let Ok((mut visibility, mut node)) = placeholders.get_mut(placeholder.0)
+        {
+            let show = inp.value.is_empty();
+            *visibility = if show {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+            node.display = if show { Display::Flex } else { Display::None };
+        }
+        if let Some(mut bc) = visuals.border {
             bc.set_all(if inp.focused {
                 inp.focused_border
             } else {
@@ -536,8 +463,12 @@ fn sync_text_input_visuals(
         if let Some(text_e) = inp.text_entity
             && let Ok((mut t, mut tc)) = texts.get_mut(text_e)
         {
-            let (display, color) = if inp.value.is_empty() && !inp.focused {
-                (inp.placeholder.clone(), Color::srgba(0.66, 0.72, 0.82, 0.85))
+            let (display, color) = if inp.value.is_empty() && !inp.focused && placeholder.is_none()
+            {
+                (
+                    inp.placeholder.clone(),
+                    Color::srgba(0.66, 0.72, 0.82, 0.85),
+                )
             } else {
                 let core = if inp.is_password {
                     "*".repeat(inp.value.chars().count())
@@ -598,32 +529,49 @@ fn sync_filled_bars(mut bars: Query<(&UiFilledBar, &mut Node), Changed<UiFilledB
 
 fn update_scroll_areas(
     mut wheels: MessageReader<MouseWheel>,
-    mut areas: Query<(&UiScrollArea, &Hovered, &ComputedNode, &mut ScrollPosition)>,
+    mut areas: Query<(
+        &UiScrollArea,
+        &Hovered,
+        &Node,
+        &ComputedNode,
+        &mut ScrollPosition,
+    )>,
 ) {
+    let mut delta_x = 0.0_f32;
     let mut delta_y = 0.0_f32;
     for w in wheels.read() {
         let mult = match w.unit {
             MouseScrollUnit::Line => 36.0,
             MouseScrollUnit::Pixel => 1.0,
         };
+        delta_x += w.x * mult;
         delta_y += w.y * mult;
     }
-    if delta_y.abs() <= 1e-4 {
+    if delta_y.abs() <= 1e-4 && delta_x.abs() <= 1e-4 {
         return;
     }
 
-    for (area, hovered, computed, mut pos) in &mut areas {
+    for (area, hovered, node, computed, mut pos) in &mut areas {
         if !hovered.get() {
             continue;
         }
         let inv = computed.inverse_scale_factor.max(1e-4);
         let max_scroll_y = ((computed.content_size().y - computed.size().y) * inv).max(0.0);
         let max_scroll_x = ((computed.content_size().x - computed.size().x) * inv).max(0.0);
-        let step = delta_y * area.speed_px.max(1.0);
-        if max_scroll_y > 0.5 {
-            pos.y = (pos.y - step).clamp(0.0, max_scroll_y);
-        } else if max_scroll_x > 0.5 {
-            pos.x = (pos.x - step).clamp(0.0, max_scroll_x);
+        let horizontal = node.overflow.x == OverflowAxis::Scroll;
+        let vertical = node.overflow.y == OverflowAxis::Scroll;
+        let speed = area.speed_px.max(1.0);
+        if vertical {
+            pos.y = (pos.y - delta_y * speed).clamp(0.0, max_scroll_y);
+        }
+        if horizontal {
+            // A regular wheel also operates horizontal-only Unity ScrollRects.
+            let delta = if vertical || delta_x.abs() > 1e-4 {
+                delta_x
+            } else {
+                delta_y
+            };
+            pos.x = (pos.x - delta * speed).clamp(0.0, max_scroll_x);
         }
     }
 }
@@ -632,6 +580,83 @@ fn update_scroll_areas(
 mod tests {
     use super::*;
     use bevy::input::keyboard::KeyCode;
+
+    #[test]
+    fn scroll_wheel_respects_native_axes_and_bounds() {
+        let mut app = App::new();
+        app.add_message::<MouseWheel>()
+            .add_systems(Update, update_scroll_areas);
+        let computed = ComputedNode {
+            size: Vec2::new(100.0, 100.0),
+            content_size: Vec2::new(300.0, 400.0),
+            inverse_scale_factor: 1.0,
+            ..default()
+        };
+        let mut spawn_area = |overflow| {
+            app.world_mut()
+                .spawn((
+                    UiScrollArea { speed_px: 1.0 },
+                    Hovered(true),
+                    Node {
+                        overflow,
+                        ..default()
+                    },
+                    computed,
+                    ScrollPosition::default(),
+                ))
+                .id()
+        };
+        let horizontal = spawn_area(Overflow::scroll_x());
+        let vertical = spawn_area(Overflow::scroll_y());
+        let both = spawn_area(Overflow::scroll());
+        let disabled = spawn_area(Overflow::clip());
+
+        app.world_mut().write_message(MouseWheel {
+            unit: MouseScrollUnit::Line,
+            x: -2.0,
+            y: -3.0,
+            phase: bevy::input::touch::TouchPhase::Moved,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+        assert_eq!(
+            app.world().get::<ScrollPosition>(horizontal).unwrap().0,
+            Vec2::new(72.0, 0.0)
+        );
+        assert_eq!(
+            app.world().get::<ScrollPosition>(vertical).unwrap().0,
+            Vec2::new(0.0, 108.0)
+        );
+        assert_eq!(
+            app.world().get::<ScrollPosition>(both).unwrap().0,
+            Vec2::new(72.0, 108.0)
+        );
+        assert_eq!(
+            app.world().get::<ScrollPosition>(disabled).unwrap().0,
+            Vec2::ZERO
+        );
+
+        app.world_mut().write_message(MouseWheel {
+            unit: MouseScrollUnit::Pixel,
+            x: 0.0,
+            y: -1000.0,
+            phase: bevy::input::touch::TouchPhase::Moved,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+        assert_eq!(
+            app.world().get::<ScrollPosition>(horizontal).unwrap().x,
+            200.0
+        );
+        assert_eq!(
+            app.world().get::<ScrollPosition>(horizontal).unwrap().y,
+            0.0
+        );
+        assert_eq!(
+            app.world().get::<ScrollPosition>(vertical).unwrap().y,
+            300.0
+        );
+    }
 
     #[test]
     fn slider_normalization_clamps_to_bounds() {
@@ -659,9 +684,15 @@ mod tests {
             .add_message::<UiTextInputChanged>()
             .add_message::<UiSliderChanged>()
             .add_message::<UiToggleChanged>()
-            .add_systems(Update, (handle_text_input_typing, sync_text_input_visuals).chain());
+            .add_systems(
+                Update,
+                (handle_text_input_typing, sync_text_input_visuals).chain(),
+            );
 
-        let text_e = app.world_mut().spawn((Text::default(), TextColor::WHITE)).id();
+        let text_e = app
+            .world_mut()
+            .spawn((Text::default(), TextColor::WHITE))
+            .id();
         let inp_e = app
             .world_mut()
             .spawn(UiTextInput {
@@ -700,5 +731,39 @@ mod tests {
         app.update();
 
         assert_eq!(app.world().get::<UiTextInput>(inp_e).unwrap().value, "Hi");
+    }
+
+    #[test]
+    fn native_input_limit_counts_utf16_without_splitting_surrogate_pairs() {
+        let mut app = App::new();
+        app.init_resource::<InputFocus>()
+            .add_message::<KeyboardInput>()
+            .add_message::<UiTextInputChanged>()
+            .add_systems(Update, handle_text_input_typing);
+        let entity = app
+            .world_mut()
+            .spawn(UiTextInput {
+                value: "0123456789".into(),
+                max_len: 12,
+                count_utf16_units: true,
+                ..default()
+            })
+            .id();
+        app.world_mut()
+            .resource_mut::<InputFocus>()
+            .set(entity, FocusCause::Pressed);
+        app.world_mut().write_message(KeyboardInput {
+            key_code: KeyCode::KeyA,
+            logical_key: Key::Character("😀x".into()),
+            state: ButtonState::Pressed,
+            text: Some("😀x".into()),
+            repeat: false,
+            window: Entity::PLACEHOLDER,
+        });
+        app.update();
+        assert_eq!(
+            app.world().get::<UiTextInput>(entity).unwrap().value,
+            "0123456789😀"
+        );
     }
 }

@@ -2,12 +2,12 @@
 
 use crate::workspace_io::UnityWorkspaceData;
 use crate::{IoResult, read_object};
-use rabex::files::bundlefile::{BundleFileReader, ExtractionConfig};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read};
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use unity_asset_core::UnityValue;
+use unity_asset_binary::bundle::{BundleLoadOptions, BundleParser};
 use zip::ZipArchive;
 
 /// Summary returned after resolving cross-bundle dependencies for one or more loaded files.
@@ -241,7 +241,6 @@ fn ensure_deferred_cab_index(workspace: &mut UnityWorkspaceData) {
     }
 
     let mut cab_map = HashMap::new();
-    let cfg = ExtractionConfig::default();
 
     for (archive_path, items) in by_archive {
         let Ok(file) = File::open(&archive_path) else {
@@ -267,14 +266,13 @@ fn ensure_deferred_cab_index(workspace: &mut UnityWorkspaceData) {
             if !head.starts_with(b"UnityFS\0") {
                 continue;
             }
-            if let Ok(bundle) = BundleFileReader::from_reader(Cursor::new(&head), &cfg) {
-                for fe in bundle.files() {
-                    let key = fe
-                        .path
+            if let Ok(names) = unityfs_directory_names(&head) {
+                for name in names {
+                    let key = name
                         .replace('\\', "/")
                         .rsplit('/')
                         .next()
-                        .unwrap_or(&fe.path)
+                        .unwrap_or(&name)
                         .to_ascii_lowercase();
                     if !key.is_empty() {
                         cab_map.entry(key).or_insert(idx);
@@ -285,15 +283,14 @@ fn ensure_deferred_cab_index(workspace: &mut UnityWorkspaceData) {
             {
                 let mut full = Vec::new();
                 if ze_full.read_to_end(&mut full).is_ok()
-                    && let Ok(bundle) = BundleFileReader::from_reader(Cursor::new(&full), &cfg)
+                    && let Ok(names) = unityfs_directory_names(&full)
                 {
-                    for fe in bundle.files() {
-                        let key = fe
-                            .path
+                    for name in names {
+                        let key = name
                             .replace('\\', "/")
                             .rsplit('/')
                             .next()
-                            .unwrap_or(&fe.path)
+                            .unwrap_or(&name)
                             .to_ascii_lowercase();
                         if !key.is_empty() {
                             cab_map.entry(key).or_insert(idx);
@@ -305,4 +302,55 @@ fn ensure_deferred_cab_index(workspace: &mut UnityWorkspaceData) {
     }
 
     workspace.deferred_cab_index = Some(cab_map);
+}
+
+/// Read only UnityFS directory metadata, using the same parser as bundle ingestion. Unlike
+/// rabex's typed header parser this accepts regional revision suffixes (`2021.3.23f1c1`).
+/// The prefix may omit payload blocks, so full-file size validation is intentionally disabled;
+/// metadata bounds remain enforced, and no payload is decompressed or asset parsed here.
+fn unityfs_directory_names(bytes: &[u8]) -> Result<Vec<String>, unity_asset_binary::error::BinaryError> {
+    let options = BundleLoadOptions {
+        validate: false,
+        ..BundleLoadOptions::lazy()
+    };
+    let bundle = BundleParser::from_slice_with_options(bytes, options)?;
+    Ok(bundle.nodes.into_iter().map(|node| node.name).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cab_directory_accepts_regional_unity_revision_without_decoding_payload() {
+        // A UnityFS v8 directory with a deliberately invalid LZ4 payload. Directory discovery
+        // must succeed independently of payload decoding and must preserve the declared CAB.
+        let mut info = vec![0u8; 16];
+        info.extend_from_slice(&1i32.to_be_bytes());
+        info.extend_from_slice(&100u32.to_be_bytes());
+        info.extend_from_slice(&1u32.to_be_bytes());
+        info.extend_from_slice(&2u16.to_be_bytes());
+        info.extend_from_slice(&1i32.to_be_bytes());
+        info.extend_from_slice(&0i64.to_be_bytes());
+        info.extend_from_slice(&100i64.to_be_bytes());
+        info.extend_from_slice(&4u32.to_be_bytes());
+        info.extend_from_slice(b"CAB-regional-terrain\0");
+
+        let mut bytes = b"UnityFS\0".to_vec();
+        bytes.extend_from_slice(&8u32.to_be_bytes());
+        bytes.extend_from_slice(b"5.x.x\0");
+        bytes.extend_from_slice(b"2021.3.23f1c1\0");
+        let size_offset = bytes.len();
+        bytes.extend_from_slice(&0u64.to_be_bytes());
+        bytes.extend_from_slice(&(info.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&(info.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&0x40u32.to_be_bytes());
+        while !bytes.len().is_multiple_of(16) { bytes.push(0); }
+        bytes.extend_from_slice(&info);
+        bytes.push(0xff);
+        let size = bytes.len() as u64;
+        bytes[size_offset..size_offset + 8].copy_from_slice(&size.to_be_bytes());
+
+        assert_eq!(unityfs_directory_names(&bytes).expect("directory"), ["CAB-regional-terrain"]);
+    }
 }

@@ -2,6 +2,7 @@
 //!
 //! Designed strictly over `std::io` with deterministic little-endian framing bounded below
 //! typical Ethernet MTU (`MAX_SNAPSHOT_PEERS = 48`).
+//! This is the replacement game's local framing, not the APK's original wire format.
 
 use std::io::Cursor;
 
@@ -26,11 +27,17 @@ pub const MAX_SYNC_DROPS: usize = 8;
 /// Maximum replicated Phase 5 vehicles inside one `WorldStateSync` packet (`991B` total worst-case).
 pub const MAX_SYNC_VEHICLES: usize = 4;
 
+/// Local datagram bound for exact inventory pages (1045 bytes at capacity).
+pub const MAX_INVENTORY_ITEMS_PER_PAGE: usize = 128;
+
+/// Local datagram bound for crafting queue replication, not an original gameplay limit.
+pub const MAX_CRAFT_QUEUE_ENTRIES: usize = 32;
+
 /// Protocol magic header `"BZNP"` (`Bevy Zero Network Protocol`).
 pub const PROTOCOL_MAGIC: [u8; 4] = *b"BZNP";
 
-/// Wire format version verified during `Hello` / `Welcome`.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Local framing version; version two adds native-width crafting and exact inventory pages.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Fixed authoritative server simulation rate in Hz.
 pub const TICK_HZ: f64 = 30.0;
@@ -108,6 +115,23 @@ pub struct NetVehicleDto {
     pub pos: [f32; 3],
     pub yaw: f32,
     pub hp: u16,
+}
+
+/// One inventory entry preserving the native signed 32-bit item ID and quantity fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetInventoryItemDto {
+    pub item_id: i32,
+    pub num: i32,
+}
+
+/// One local crafting queue entry; facility IDs retain native signed 64-bit values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetCraftQueueDto {
+    pub drawing_id: i32,
+    pub remaining_count: i32,
+    pub remaining_ms: u32,
+    pub batch_ms: u32,
+    pub facility_id: i64,
 }
 
 /// Action sub-codes carried by [`PacketKind::WorldOp`].
@@ -193,9 +217,34 @@ pub enum PacketKind {
         drops: Vec<NetLootDropDto>,
         vehicles: Vec<NetVehicleDto>,
     },
+    CraftRequest {
+        request_id: u32,
+        drawing_id: i32,
+        create_num: i32,
+        near_building_instance_id: i64,
+    },
+    /// All pages of one revision form an exact inventory, including an empty single page.
+    InventorySnapshot {
+        revision: u32,
+        page_index: u16,
+        page_count: u16,
+        items: Vec<NetInventoryItemDto>,
+    },
+    CraftStateSync {
+        server_tick: u32,
+        queue: Vec<NetCraftQueueDto>,
+    },
+    CraftResult {
+        request_id: u32,
+        accepted: bool,
+        reason: String,
+    },
 }
 
 /// Serializes `env` into a compact binary UDP datagram.
+///
+/// New crafting/inventory messages assert their local bounds instead of dropping data.
+/// Invalid internal messages are programmer errors; untrusted input uses [`decode_packet`].
 pub fn encode_packet(env: &PacketEnvelope) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     out.extend_from_slice(&PROTOCOL_MAGIC);
@@ -380,6 +429,76 @@ pub fn encode_packet(env: &PacketEnvelope) -> Vec<u8> {
                 out.extend_from_slice(&v.hp.to_le_bytes());
             }
         }
+        PacketKind::CraftRequest {
+            request_id,
+            drawing_id,
+            create_num,
+            near_building_instance_id,
+        } => {
+            assert!(*drawing_id > 0, "craft drawing ID must be positive");
+            assert!(*create_num > 0, "craft count must be positive");
+            out.push(11);
+            out.extend_from_slice(&request_id.to_le_bytes());
+            out.extend_from_slice(&drawing_id.to_le_bytes());
+            out.extend_from_slice(&create_num.to_le_bytes());
+            out.extend_from_slice(&near_building_instance_id.to_le_bytes());
+        }
+        PacketKind::InventorySnapshot {
+            revision,
+            page_index,
+            page_count,
+            items,
+        } => {
+            assert!(
+                validate_inventory_page(*page_index, *page_count, items.len()).is_ok(),
+                "invalid inventory page index or count"
+            );
+            assert!(
+                items.iter().all(|item| item.item_id > 0 && item.num >= 0),
+                "inventory IDs must be positive and amounts nonnegative"
+            );
+            out.push(12);
+            out.extend_from_slice(&revision.to_le_bytes());
+            out.extend_from_slice(&page_index.to_le_bytes());
+            out.extend_from_slice(&page_count.to_le_bytes());
+            out.extend_from_slice(&(items.len() as u16).to_le_bytes());
+            for item in items {
+                out.extend_from_slice(&item.item_id.to_le_bytes());
+                out.extend_from_slice(&item.num.to_le_bytes());
+            }
+        }
+        PacketKind::CraftStateSync { server_tick, queue } => {
+            assert!(
+                queue.len() <= MAX_CRAFT_QUEUE_ENTRIES,
+                "craft queue exceeds local datagram bound"
+            );
+            assert!(
+                queue
+                    .iter()
+                    .all(|entry| entry.drawing_id > 0 && entry.remaining_count > 0),
+                "craft queue drawing IDs and remaining counts must be positive"
+            );
+            out.push(13);
+            out.extend_from_slice(&server_tick.to_le_bytes());
+            out.push(queue.len() as u8);
+            for entry in queue {
+                out.extend_from_slice(&entry.drawing_id.to_le_bytes());
+                out.extend_from_slice(&entry.remaining_count.to_le_bytes());
+                out.extend_from_slice(&entry.remaining_ms.to_le_bytes());
+                out.extend_from_slice(&entry.batch_ms.to_le_bytes());
+                out.extend_from_slice(&entry.facility_id.to_le_bytes());
+            }
+        }
+        PacketKind::CraftResult {
+            request_id,
+            accepted,
+            reason,
+        } => {
+            out.push(14);
+            out.extend_from_slice(&request_id.to_le_bytes());
+            out.push(u8::from(*accepted));
+            write_str_exact(&mut out, reason);
+        }
     }
     out
 }
@@ -435,7 +554,9 @@ pub fn decode_packet(bytes: &[u8]) -> Result<PacketEnvelope, String> {
             let total_online = read_u8(&mut cur)?;
             let count = usize::from(read_u8(&mut cur)?);
             if count > MAX_SNAPSHOT_PEERS {
-                return Err(format!("snapshot peer count {count} exceeds {MAX_SNAPSHOT_PEERS}"));
+                return Err(format!(
+                    "snapshot peer count {count} exceeds {MAX_SNAPSHOT_PEERS}"
+                ));
             }
             let mut peers = Vec::with_capacity(count);
             for _ in 0..count {
@@ -481,7 +602,9 @@ pub fn decode_packet(bytes: &[u8]) -> Result<PacketEnvelope, String> {
             let base_power_pct = read_u8(&mut cur)?;
             let sc = usize::from(read_u8(&mut cur)?);
             if sc > MAX_SYNC_STRUCTURES {
-                return Err(format!("sync structure count {sc} exceeds {MAX_SYNC_STRUCTURES}"));
+                return Err(format!(
+                    "sync structure count {sc} exceeds {MAX_SYNC_STRUCTURES}"
+                ));
             }
             let mut structures = Vec::with_capacity(sc);
             for _ in 0..sc {
@@ -550,7 +673,9 @@ pub fn decode_packet(bytes: &[u8]) -> Result<PacketEnvelope, String> {
             }
             let vc = usize::from(read_u8(&mut cur)?);
             if vc > MAX_SYNC_VEHICLES {
-                return Err(format!("sync vehicle count {vc} exceeds {MAX_SYNC_VEHICLES}"));
+                return Err(format!(
+                    "sync vehicle count {vc} exceeds {MAX_SYNC_VEHICLES}"
+                ));
             }
             let mut vehicles = Vec::with_capacity(vc);
             for _ in 0..vc {
@@ -585,10 +710,110 @@ pub fn decode_packet(bytes: &[u8]) -> Result<PacketEnvelope, String> {
                 vehicles,
             }
         }
+        11 => {
+            let request_id = read_u32(&mut cur)?;
+            let drawing_id = read_i32(&mut cur)?;
+            let create_num = read_i32(&mut cur)?;
+            let near_building_instance_id = read_i64(&mut cur)?;
+            if drawing_id <= 0 || create_num <= 0 {
+                return Err("craft drawing ID and count must be positive".to_owned());
+            }
+            PacketKind::CraftRequest {
+                request_id,
+                drawing_id,
+                create_num,
+                near_building_instance_id,
+            }
+        }
+        12 => {
+            let revision = read_u32(&mut cur)?;
+            let page_index = read_u16(&mut cur)?;
+            let page_count = read_u16(&mut cur)?;
+            let count = usize::from(read_u16(&mut cur)?);
+            validate_inventory_page(page_index, page_count, count)?;
+            let mut items = Vec::with_capacity(count);
+            for _ in 0..count {
+                let item_id = read_i32(&mut cur)?;
+                let num = read_i32(&mut cur)?;
+                if item_id <= 0 || num < 0 {
+                    return Err("inventory IDs must be positive and amounts nonnegative".to_owned());
+                }
+                items.push(NetInventoryItemDto { item_id, num });
+            }
+            PacketKind::InventorySnapshot {
+                revision,
+                page_index,
+                page_count,
+                items,
+            }
+        }
+        13 => {
+            let server_tick = read_u32(&mut cur)?;
+            let count = usize::from(read_u8(&mut cur)?);
+            if count > MAX_CRAFT_QUEUE_ENTRIES {
+                return Err(format!(
+                    "craft queue count {count} exceeds {MAX_CRAFT_QUEUE_ENTRIES}"
+                ));
+            }
+            let mut queue = Vec::with_capacity(count);
+            for _ in 0..count {
+                let entry = NetCraftQueueDto {
+                    drawing_id: read_i32(&mut cur)?,
+                    remaining_count: read_i32(&mut cur)?,
+                    remaining_ms: read_u32(&mut cur)?,
+                    batch_ms: read_u32(&mut cur)?,
+                    facility_id: read_i64(&mut cur)?,
+                };
+                if entry.drawing_id <= 0 || entry.remaining_count <= 0 {
+                    return Err(
+                        "craft queue drawing IDs and remaining counts must be positive".to_owned(),
+                    );
+                }
+                queue.push(entry);
+            }
+            PacketKind::CraftStateSync { server_tick, queue }
+        }
+        14 => PacketKind::CraftResult {
+            request_id: read_u32(&mut cur)?,
+            accepted: read_bool(&mut cur)?,
+            reason: read_str(&mut cur)?,
+        },
         other => return Err(format!("unknown packet tag {other}")),
     };
 
+    if cur.position() != cur.get_ref().len() as u64 {
+        return Err("trailing bytes after packet body".to_owned());
+    }
     Ok(PacketEnvelope { seq, kind })
+}
+
+fn validate_inventory_page(page_index: u16, page_count: u16, count: usize) -> Result<(), String> {
+    if page_count == 0 || page_index >= page_count {
+        return Err(format!(
+            "invalid inventory page {page_index} of {page_count}"
+        ));
+    }
+    if count > MAX_INVENTORY_ITEMS_PER_PAGE {
+        return Err(format!(
+            "inventory item count {count} exceeds {MAX_INVENTORY_ITEMS_PER_PAGE}"
+        ));
+    }
+    if page_index < page_count - 1 && count != MAX_INVENTORY_ITEMS_PER_PAGE {
+        return Err("nonfinal inventory page must be full".to_owned());
+    }
+    if count == 0 && page_count != 1 {
+        return Err("only a single-page inventory can be empty".to_owned());
+    }
+    Ok(())
+}
+
+fn write_str_exact(out: &mut Vec<u8>, s: &str) {
+    assert!(
+        s.len() <= MAX_STR_LEN,
+        "string exceeds local datagram bound"
+    );
+    out.extend_from_slice(&(s.len() as u16).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
 }
 
 fn write_str(out: &mut Vec<u8>, s: &str) {
@@ -613,6 +838,14 @@ fn read_u8(cur: &mut Cursor<&[u8]>) -> Result<u8, String> {
     Ok(read_bytes(cur, 1)?[0])
 }
 
+fn read_bool(cur: &mut Cursor<&[u8]>) -> Result<bool, String> {
+    match read_u8(cur)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(format!("invalid boolean value {other}")),
+    }
+}
+
 fn read_u16(cur: &mut Cursor<&[u8]>) -> Result<u16, String> {
     let b: [u8; 2] = read_bytes(cur, 2)?.try_into().map_err(|_| "u16 slice")?;
     Ok(u16::from_le_bytes(b))
@@ -631,6 +864,11 @@ fn read_i32(cur: &mut Cursor<&[u8]>) -> Result<i32, String> {
 fn read_u64(cur: &mut Cursor<&[u8]>) -> Result<u64, String> {
     let b: [u8; 8] = read_bytes(cur, 8)?.try_into().map_err(|_| "u64 slice")?;
     Ok(u64::from_le_bytes(b))
+}
+
+fn read_i64(cur: &mut Cursor<&[u8]>) -> Result<i64, String> {
+    let b: [u8; 8] = read_bytes(cur, 8)?.try_into().map_err(|_| "i64 slice")?;
+    Ok(i64::from_le_bytes(b))
 }
 
 fn read_f32(cur: &mut Cursor<&[u8]>) -> Result<f32, String> {
@@ -685,7 +923,11 @@ mod tests {
         };
         let bytes = encode_packet(&snap);
         // Capped at MAX_SNAPSHOT_PEERS so every datagram fits safely under 1200B MTU.
-        assert!(bytes.len() < 1100, "packet exceeded safe MTU: {}B", bytes.len());
+        assert!(
+            bytes.len() < 1100,
+            "packet exceeded safe MTU: {}B",
+            bytes.len()
+        );
         let decoded = decode_packet(&bytes).unwrap();
         match decoded.kind {
             PacketKind::WorldSnapshot {
@@ -710,6 +952,320 @@ mod tests {
         });
         bad[0] = b'X';
         assert!(decode_packet(&bad).is_err());
+    }
+
+    #[test]
+    fn craft_request_preserves_native_widths_and_no_workbench_sentinel() {
+        for facility in [-1, i64::MIN, 0x1234_5678_9abc_def0, i64::MAX] {
+            let request = PacketEnvelope {
+                seq: 300,
+                kind: PacketKind::CraftRequest {
+                    request_id: u32::MAX,
+                    drawing_id: 57100,
+                    create_num: 999,
+                    near_building_instance_id: facility,
+                },
+            };
+            let encoded = encode_packet(&request);
+            assert_eq!(encoded.len(), 31);
+            assert_eq!(decode_packet(&encoded).unwrap(), request);
+        }
+        // The native field width is independent of any UI slider limit.
+        let request = PacketEnvelope {
+            seq: 301,
+            kind: PacketKind::CraftRequest {
+                request_id: 1,
+                drawing_id: i32::MAX,
+                create_num: i32::MAX,
+                near_building_instance_id: -1,
+            },
+        };
+        assert_eq!(decode_packet(&encode_packet(&request)).unwrap(), request);
+    }
+
+    #[test]
+    fn inventory_pages_roundtrip_every_native_item_within_mtu() {
+        let items: Vec<_> = (1..=257)
+            .map(|item_id| NetInventoryItemDto {
+                item_id,
+                num: if item_id == 257 {
+                    i32::MAX
+                } else {
+                    item_id - 1
+                },
+            })
+            .collect();
+        let pages: Vec<_> = items.chunks(MAX_INVENTORY_ITEMS_PER_PAGE).collect();
+        let mut recovered = Vec::new();
+        for (index, page) in pages.iter().enumerate() {
+            let snapshot = PacketEnvelope {
+                seq: index as u32,
+                kind: PacketKind::InventorySnapshot {
+                    revision: u32::MAX,
+                    page_index: index as u16,
+                    page_count: pages.len() as u16,
+                    items: page.to_vec(),
+                },
+            };
+            let encoded = encode_packet(&snapshot);
+            assert!(encoded.len() < 1100);
+            if index == 0 {
+                assert_eq!(encoded.len(), 1045);
+            }
+            let decoded = decode_packet(&encoded).unwrap();
+            assert_eq!(decoded, snapshot);
+            if let PacketKind::InventorySnapshot { items, .. } = decoded.kind {
+                recovered.extend(items);
+            }
+        }
+        assert_eq!(recovered, items);
+
+        let empty = PacketEnvelope {
+            seq: 4,
+            kind: PacketKind::InventorySnapshot {
+                revision: 0,
+                page_index: 0,
+                page_count: 1,
+                items: Vec::new(),
+            },
+        };
+        assert_eq!(decode_packet(&encode_packet(&empty)).unwrap(), empty);
+    }
+
+    #[test]
+    fn craft_queue_and_result_roundtrip_at_local_bounds() {
+        let queue = PacketEnvelope {
+            seq: 17,
+            kind: PacketKind::CraftStateSync {
+                server_tick: u32::MAX,
+                queue: (0..MAX_CRAFT_QUEUE_ENTRIES)
+                    .map(|index| NetCraftQueueDto {
+                        drawing_id: 57100,
+                        remaining_count: 999,
+                        remaining_ms: u32::MAX,
+                        batch_ms: index as u32,
+                        facility_id: if index == 0 { -1 } else { i64::MAX },
+                    })
+                    .collect(),
+            },
+        };
+        let encoded = encode_packet(&queue);
+        assert_eq!(encoded.len(), 784);
+        assert!(encoded.len() < 1100);
+        assert_eq!(decode_packet(&encoded).unwrap(), queue);
+
+        for accepted in [false, true] {
+            let result = PacketEnvelope {
+                seq: 18,
+                kind: PacketKind::CraftResult {
+                    request_id: u32::MAX,
+                    accepted,
+                    reason: "é".repeat(MAX_STR_LEN / 2),
+                },
+            };
+            assert_eq!(decode_packet(&encode_packet(&result)).unwrap(), result);
+        }
+
+        let empty = PacketEnvelope {
+            seq: 19,
+            kind: PacketKind::CraftStateSync {
+                server_tick: 0,
+                queue: Vec::new(),
+            },
+        };
+        assert_eq!(decode_packet(&encode_packet(&empty)).unwrap(), empty);
+    }
+
+    #[test]
+    fn inventory_decoder_rejects_bad_pages_counts_and_item_fields() {
+        let valid = encode_packet(&PacketEnvelope {
+            seq: 3,
+            kind: PacketKind::InventorySnapshot {
+                revision: 1,
+                page_index: 0,
+                page_count: 1,
+                items: vec![NetInventoryItemDto {
+                    item_id: 57100,
+                    num: 999,
+                }],
+            },
+        });
+        for (offset, field) in [
+            (15, 1_u16), // index equals page count
+            (17, 0),     // zero pages
+            (17, 2),     // nonfinal page is not full
+            (19, MAX_INVENTORY_ITEMS_PER_PAGE as u16 + 1),
+        ] {
+            let mut malformed = valid.clone();
+            malformed[offset..offset + 2].copy_from_slice(&field.to_le_bytes());
+            assert!(decode_packet(&malformed).is_err());
+        }
+        for (offset, field) in [(21, 0_i32), (21, -1), (25, -1)] {
+            let mut malformed = valid.clone();
+            malformed[offset..offset + 4].copy_from_slice(&field.to_le_bytes());
+            assert!(decode_packet(&malformed).is_err());
+        }
+
+        let mut empty_final_page = valid[..21].to_vec();
+        empty_final_page[15..17].copy_from_slice(&1_u16.to_le_bytes());
+        empty_final_page[17..19].copy_from_slice(&2_u16.to_le_bytes());
+        empty_final_page[19..21].copy_from_slice(&0_u16.to_le_bytes());
+        assert!(decode_packet(&empty_final_page).is_err());
+    }
+
+    #[test]
+    fn craft_decoder_rejects_bad_counts_boolean_and_utf8() {
+        let request = encode_packet(&PacketEnvelope {
+            seq: 1,
+            kind: PacketKind::CraftRequest {
+                request_id: 1,
+                drawing_id: 57100,
+                create_num: 999,
+                near_building_instance_id: -1,
+            },
+        });
+        for (offset, field) in [(15, 0_i32), (15, -1), (19, 0), (19, -1)] {
+            let mut malformed = request.clone();
+            malformed[offset..offset + 4].copy_from_slice(&field.to_le_bytes());
+            assert!(decode_packet(&malformed).is_err());
+        }
+
+        let queue = encode_packet(&PacketEnvelope {
+            seq: 2,
+            kind: PacketKind::CraftStateSync {
+                server_tick: 1,
+                queue: vec![NetCraftQueueDto {
+                    drawing_id: 57100,
+                    remaining_count: 999,
+                    remaining_ms: 1000,
+                    batch_ms: 2000,
+                    facility_id: -1,
+                }],
+            },
+        });
+        let mut oversized = queue.clone();
+        oversized[15] = MAX_CRAFT_QUEUE_ENTRIES as u8 + 1;
+        assert!(decode_packet(&oversized).is_err());
+        for (offset, field) in [(16, 0_i32), (16, -1), (20, 0), (20, -1)] {
+            let mut malformed = queue.clone();
+            malformed[offset..offset + 4].copy_from_slice(&field.to_le_bytes());
+            assert!(decode_packet(&malformed).is_err());
+        }
+
+        let result = encode_packet(&PacketEnvelope {
+            seq: 3,
+            kind: PacketKind::CraftResult {
+                request_id: 1,
+                accepted: true,
+                reason: "ok".to_owned(),
+            },
+        });
+        let mut invalid_bool = result.clone();
+        invalid_bool[15] = 2;
+        assert!(decode_packet(&invalid_bool).is_err());
+        let mut invalid_utf8 = result.clone();
+        invalid_utf8[18] = 0xff;
+        assert!(decode_packet(&invalid_utf8).is_err());
+        let mut oversized_reason = result;
+        oversized_reason[16..18].copy_from_slice(&(MAX_STR_LEN as u16 + 1).to_le_bytes());
+        assert!(decode_packet(&oversized_reason).is_err());
+    }
+
+    #[test]
+    fn new_messages_reject_every_truncation_trailing_bytes_and_stale_version() {
+        let messages = [
+            PacketKind::CraftRequest {
+                request_id: 1,
+                drawing_id: 57100,
+                create_num: 999,
+                near_building_instance_id: i64::MAX,
+            },
+            PacketKind::InventorySnapshot {
+                revision: 1,
+                page_index: 0,
+                page_count: 1,
+                items: vec![NetInventoryItemDto {
+                    item_id: 57100,
+                    num: 999,
+                }],
+            },
+            PacketKind::CraftStateSync {
+                server_tick: 1,
+                queue: vec![NetCraftQueueDto {
+                    drawing_id: 57100,
+                    remaining_count: 999,
+                    remaining_ms: 1000,
+                    batch_ms: 2000,
+                    facility_id: i64::MAX,
+                }],
+            },
+            PacketKind::CraftResult {
+                request_id: 1,
+                accepted: false,
+                reason: "materials missing".to_owned(),
+            },
+        ];
+        for kind in messages {
+            let valid = encode_packet(&PacketEnvelope { seq: 1, kind });
+            for length in 0..valid.len() {
+                assert!(
+                    decode_packet(&valid[..length]).is_err(),
+                    "accepted {length}-byte prefix"
+                );
+            }
+            let mut trailing = valid.clone();
+            trailing.push(0);
+            assert!(decode_packet(&trailing).is_err());
+            let mut stale = valid;
+            stale[4..6].copy_from_slice(&1_u16.to_le_bytes());
+            assert!(
+                decode_packet(&stale)
+                    .unwrap_err()
+                    .contains("unsupported protocol version 1")
+            );
+        }
+    }
+
+    #[test]
+    fn new_message_encoders_assert_bounds_instead_of_truncating() {
+        let invalid = [
+            PacketKind::InventorySnapshot {
+                revision: 1,
+                page_index: 0,
+                page_count: 1,
+                items: vec![
+                    NetInventoryItemDto {
+                        item_id: 57100,
+                        num: 999
+                    };
+                    MAX_INVENTORY_ITEMS_PER_PAGE + 1
+                ],
+            },
+            PacketKind::CraftStateSync {
+                server_tick: 1,
+                queue: vec![
+                    NetCraftQueueDto {
+                        drawing_id: 57100,
+                        remaining_count: 999,
+                        remaining_ms: 1000,
+                        batch_ms: 2000,
+                        facility_id: -1,
+                    };
+                    MAX_CRAFT_QUEUE_ENTRIES + 1
+                ],
+            },
+            PacketKind::CraftResult {
+                request_id: 1,
+                accepted: false,
+                reason: "x".repeat(MAX_STR_LEN + 1),
+            },
+        ];
+        for kind in invalid {
+            assert!(
+                std::panic::catch_unwind(|| encode_packet(&PacketEnvelope { seq: 1, kind }))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

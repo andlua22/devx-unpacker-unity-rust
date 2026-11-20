@@ -11,6 +11,7 @@ pub enum AppState {
     LauncherSplash,
     LoginLobby,
     MainLobby,
+    WarChoice,
     LoadingScene,
     InGame,
     DevSandbox,

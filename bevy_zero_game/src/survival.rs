@@ -3,6 +3,8 @@
 
 use bevy::prelude::*;
 
+use crate::crafting::{CraftContext, CraftMode};
+
 use crate::world_physics::BuildPieceKind;
 
 /// Action/item bound to each `[1..0]` slot in the bottom survival hotbar.
@@ -53,59 +55,20 @@ impl HotbarItem {
     }
 }
 
-/// Interactive crafting recipe (`[Tab]` menu) wired to `OP_CRAFT_RECIPE`.
-#[derive(Debug, Clone, Copy)]
-pub struct CraftRecipeDesc {
-    pub id: u8,
-    pub title: &'static str,
-    pub cost_text: &'static str,
-}
-
-pub const CRAFT_RECIPES: &[CraftRecipeDesc] = &[
-    CraftRecipeDesc {
-        id: 0,
-        title: "Craft 15x Rifle Ammo",
-        cost_text: "10 Wood + 5 Stone",
-    },
-    CraftRecipeDesc {
-        id: 1,
-        title: "Craft 1x Bandage (+35 HP)",
-        cost_text: "10 Fiber",
-    },
-    CraftRecipeDesc {
-        id: 2,
-        title: "Refine 20x Stone Blocks",
-        cost_text: "15 Wood",
-    },
-    CraftRecipeDesc {
-        id: 3,
-        title: "Smelt 12x Iron Ingots",
-        cost_text: "20 Stone",
-    },
-    CraftRecipeDesc {
-        id: 4,
-        title: "Craft Heavy Ammo Pack (+30 Ammo)",
-        cost_text: "15 Iron + 10 Wood",
-    },
-    CraftRecipeDesc {
-        id: 5,
-        title: "Synthesize Generator Fuel (+350 Fuel)",
-        cost_text: "15 Wood + 10 Iron + 10 Fiber",
-    },
-    CraftRecipeDesc {
-        id: 6,
-        title: "Repair Nearest Vehicle (+220 HP)",
-        cost_text: "20 Wood + 15 Iron",
-    },
-];
-
 /// Client-side survival HUD, crosshair ray target, build ghost, and cooldown state.
 #[derive(Resource)]
 pub struct SurvivalSessionState {
+    pub craft_mode: CraftMode,
+    pub battle_mode: i32,
     pub active_slot: usize,
     pub custom_build_override: Option<BuildPieceKind>,
     pub build_rot_steps: u8,
     pub craft_menu_open: bool,
+    pub craft_selected_drawing: Option<i32>,
+    pub craft_quantity: i32,
+    pub craft_primary_tab: i32,
+    pub craft_secondary_tab: i32,
+    pub craft_selected_queue: Option<usize>,
     pub hovered_prompt: String,
     pub active_chunk: String,
     pub attack_cooldown: f32,
@@ -131,10 +94,17 @@ pub struct SurvivalSessionState {
 impl Default for SurvivalSessionState {
     fn default() -> Self {
         Self {
+            craft_mode: CraftMode::Island,
+            battle_mode: 0,
             active_slot: 0,
             custom_build_override: None,
             build_rot_steps: 0,
             craft_menu_open: false,
+            craft_selected_drawing: Some(57100),
+            craft_quantity: 1,
+            craft_primary_tab: 1,
+            craft_secondary_tab: 1,
+            craft_selected_queue: None,
             hovered_prompt:
                 "LMB: Fire/Gather | [4-0/T/G] Build | [F] Board/Use | [Tab] Craft | [F5] Save Base"
                     .to_owned(),
@@ -158,6 +128,12 @@ impl Default for SurvivalSessionState {
             status_banner: String::new(),
             status_banner_secs: 0.0,
         }
+    }
+}
+
+impl SurvivalSessionState {
+    pub fn craft_context(&self) -> CraftContext {
+        CraftContext { mode: self.craft_mode, battle_mode: self.battle_mode, ..default() }
     }
 }
 

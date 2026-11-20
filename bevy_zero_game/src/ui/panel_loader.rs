@@ -7,8 +7,8 @@ use bevy::picking::Pickable;
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::text::{FontSize, FontSource, Justify};
-use bevy::ui::{Pressed, ScrollPosition, UiTransform};
 use bevy::ui::widget::NodeImageMode;
+use bevy::ui::{Pressed, ScrollPosition, UiTransform};
 use bevy::ui_widgets::{Activate, Button, observe};
 use serde::Deserialize;
 
@@ -22,6 +22,10 @@ pub struct UiPanelDoc {
     pub name: String,
     pub reference_width: f32,
     pub reference_height: f32,
+    #[serde(default)]
+    pub scale_mode: String,
+    #[serde(default = "default_half")]
+    pub match_width_or_height: f32,
     pub root: UiPanelNodeDto,
     #[serde(default)]
     pub textures: Vec<UiTextureDto>,
@@ -44,6 +48,13 @@ pub struct UiTextureDto {
     pub height: u32,
 }
 
+/// Serialized Unity object identity. Paths and names can repeat within a panel.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq, Hash)]
+pub struct UiAssetRefDto {
+    pub file_index: usize,
+    pub path_id: i64,
+}
+
 /// Extracted Unity `MonoBehaviour` (`GameObjectData` / controller) field-to-node binding.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -56,6 +67,16 @@ pub struct UiScriptBindingDto {
     pub slot_index: Option<usize>,
     #[serde(default)]
     pub target_name: String,
+    #[serde(default)]
+    pub target_go_ref: Option<UiAssetRefDto>,
+    #[serde(default)]
+    pub owner_go_ref: Option<UiAssetRefDto>,
+    #[serde(default)]
+    pub owner_component_ref: Option<UiAssetRefDto>,
+    #[serde(default)]
+    pub owner_path: Option<String>,
+    #[serde(default)]
+    pub target_path: Option<String>,
 }
 
 /// Scalar UI animation channel decoded from a Unity `AnimationClip` (`class_id == 74`).
@@ -116,6 +137,12 @@ pub struct UiWidgetPropsDto {
     #[serde(default)]
     pub scroll_hv: Option<[bool; 2]>,
     #[serde(default)]
+    pub scroll_cell_size: Option<[f32; 2]>,
+    #[serde(default)]
+    pub scroll_rows: Option<i32>,
+    #[serde(default)]
+    pub scroll_cols: Option<i32>,
+    #[serde(default)]
     pub char_limit: Option<i32>,
     #[serde(default)]
     pub is_password: bool,
@@ -126,12 +153,22 @@ pub struct UiWidgetPropsDto {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct UiPanelNodeDto {
     pub name: String,
+    #[serde(default)]
+    pub go_ref: Option<UiAssetRefDto>,
     #[serde(default = "default_true")]
     pub active_self: bool,
     #[serde(default)]
     pub active_in_hierarchy: bool,
     #[serde(default)]
     pub anchored_position: [f32; 2],
+    #[serde(default)]
+    pub anchor_min: Option<[f32; 2]>,
+    #[serde(default)]
+    pub anchor_max: Option<[f32; 2]>,
+    #[serde(default)]
+    pub pivot: Option<[f32; 2]>,
+    #[serde(default)]
+    pub size_delta: Option<[f32; 2]>,
     #[serde(default = "default_vec3_one")]
     pub scale: [f32; 3],
     #[serde(default)]
@@ -140,6 +177,14 @@ pub struct UiPanelNodeDto {
     pub local_rect: [f32; 4],
     #[serde(default)]
     pub rotation_z_deg: f32,
+    /// World-space top-down rotation, including parent RectTransforms (new DevX exports).
+    #[serde(default)]
+    pub canvas_rotation_z_deg: Option<f32>,
+    /// Unrotated artwork box centered on the transformed rectangle's center.
+    #[serde(default)]
+    pub canvas_render_rect: Option<[f32; 4]>,
+    #[serde(default)]
+    pub canvas_parent_basis: Option<[[f32; 2]; 2]>,
     #[serde(default)]
     pub flip_x: bool,
     #[serde(default)]
@@ -166,6 +211,10 @@ pub struct UiPanelNodeDto {
 
 fn default_one() -> f32 {
     1.0
+}
+
+fn default_half() -> f32 {
+    0.5
 }
 
 fn default_vec3_one() -> [f32; 3] {
@@ -252,7 +301,209 @@ pub struct UiPanelFrame {
     pub fullscreen: bool,
 }
 
-/// Spawns a centered aspect-locked `16:9` [`UiPanelFrame`] stage inside a parent container and
+#[derive(Component)]
+pub(crate) struct UiPanelCanvasReflow {
+    source: UiPanelDoc,
+    canvas_size: Vec2,
+    scale: f32,
+}
+
+#[derive(Component)]
+pub(crate) struct UiRetainedCanvasNode {
+    frame: Entity,
+    indices: Vec<usize>,
+    artwork_child: bool,
+}
+
+/// Unity CanvasScaler result: physical viewport and its corresponding logical canvas dimensions.
+#[derive(Debug, Clone, Copy)]
+pub struct UiPanelCanvasMetrics {
+    pub scale: f32,
+    pub canvas_size: Vec2,
+    pub frame_size: Vec2,
+}
+
+pub fn compute_panel_canvas_metrics(
+    doc: &UiPanelDoc,
+    viewport: Vec2,
+    fullscreen: bool,
+) -> UiPanelCanvasMetrics {
+    let reference = Vec2::new(
+        doc.reference_width.max(64.0),
+        doc.reference_height.max(64.0),
+    );
+    if fullscreen && doc.scale_mode == "scale_with_screen_size" {
+        let viewport = viewport.max(Vec2::ONE);
+        let ratios = viewport / reference;
+        let matched = doc.match_width_or_height.clamp(0.0, 1.0);
+        let scale = (ratios.x.ln() * (1.0 - matched) + ratios.y.ln() * matched).exp();
+        UiPanelCanvasMetrics {
+            scale,
+            canvas_size: viewport / scale,
+            frame_size: viewport,
+        }
+    } else {
+        let scale = compute_panel_fit_scale(reference.x, reference.y, viewport, fullscreen);
+        UiPanelCanvasMetrics {
+            scale,
+            canvas_size: reference,
+            frame_size: reference * scale,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CanvasAffine {
+    origin: Vec2,
+    x: Vec2,
+    y: Vec2,
+}
+
+impl CanvasAffine {
+    fn point(self, point: Vec2) -> Vec2 {
+        self.origin + self.x * point.x + self.y * point.y
+    }
+}
+
+/// Reflows exported rectangles from their solved baseline, retaining layout-group and template edits.
+/// Only the parent-size contribution of native anchors changes; affine artwork stays in bind geometry.
+pub fn reflow_panel_doc(source: &UiPanelDoc, canvas_size: Vec2) -> UiPanelDoc {
+    let mut doc = source.clone();
+    let reference = Vec2::new(source.reference_width, source.reference_height);
+    let identity = CanvasAffine {
+        origin: Vec2::ZERO,
+        x: Vec2::X,
+        y: Vec2::Y,
+    };
+    reflow_canvas_node(
+        &source.root,
+        &mut doc.root,
+        reference,
+        canvas_size,
+        identity,
+        identity,
+        reference.y,
+        canvas_size.y,
+    );
+    doc.reference_width = canvas_size.x;
+    doc.reference_height = canvas_size.y;
+    doc
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reflow_canvas_node(
+    source: &UiPanelNodeDto,
+    target: &mut UiPanelNodeDto,
+    source_parent_size: Vec2,
+    target_parent_size: Vec2,
+    source_parent: CanvasAffine,
+    target_parent: CanvasAffine,
+    source_canvas_h: f32,
+    target_canvas_h: f32,
+) {
+    let Some((anchor_min, anchor_max, pivot)) = source
+        .anchor_min
+        .zip(source.anchor_max)
+        .zip(source.pivot)
+        .map(|((min, max), pivot)| (min, max, pivot))
+    else {
+        return;
+    };
+    let (sin, cos) = (-source.rotation_z_deg).to_radians().sin_cos();
+    let local_x = Vec2::new(cos, sin) * source.scale[0];
+    let local_y = Vec2::new(-sin, cos) * source.scale[1];
+    let source_x = source_parent.x * local_x.x + source_parent.y * local_x.y;
+    let source_y = source_parent.x * local_y.x + source_parent.y * local_y.y;
+    let parent_basis = Mat2::from_cols(source_parent.x, source_parent.y);
+    if source_x.length_squared() < 1e-10
+        || source_y.length_squared() < 1e-10
+        || parent_basis.determinant().abs() < 1e-10
+    {
+        return;
+    }
+    let art = source.canvas_render_rect.unwrap_or(source.canvas_rect);
+    let source_size = Vec2::new(art[2] / source_x.length(), art[3] / source_y.length());
+    let pivot = Vec2::from_array(pivot);
+    let center = Vec2::new(
+        art[0] + art[2] * 0.5,
+        source_canvas_h - art[1] - art[3] * 0.5,
+    );
+    let local_center = parent_basis.inverse() * (center - source_parent.origin);
+    let source_pivot = local_center
+        - local_x * (source_size.x * (0.5 - pivot.x))
+        - local_y * (source_size.y * (0.5 - pivot.y));
+    let source_origin = source_pivot - source_size * pivot;
+    let delta = target_parent_size - source_parent_size;
+    let anchor_min = Vec2::from_array(anchor_min);
+    let anchor_max = Vec2::from_array(anchor_max);
+    let target_size = (source_size + (anchor_max - anchor_min) * delta).max(Vec2::ZERO);
+    let target_origin = source_origin + anchor_min * delta;
+    let target_x = target_parent.x * local_x.x + target_parent.y * local_x.y;
+    let target_y = target_parent.x * local_y.x + target_parent.y * local_y.y;
+    let target_pivot = target_parent.point(target_origin + target_size * pivot);
+    let source_map = CanvasAffine {
+        origin: source_parent.point(source_pivot)
+            - source_x * (source_size.x * pivot.x)
+            - source_y * (source_size.y * pivot.y),
+        x: source_x,
+        y: source_y,
+    };
+    let target_map = CanvasAffine {
+        origin: target_pivot
+            - target_x * (target_size.x * pivot.x)
+            - target_y * (target_size.y * pivot.y),
+        x: target_x,
+        y: target_y,
+    };
+    let corners = [
+        Vec2::ZERO,
+        Vec2::new(target_size.x, 0.0),
+        Vec2::new(0.0, target_size.y),
+        target_size,
+    ]
+    .map(|point| target_map.point(point));
+    let minimum = corners
+        .into_iter()
+        .fold(Vec2::splat(f32::INFINITY), Vec2::min);
+    let maximum = corners
+        .into_iter()
+        .fold(Vec2::splat(f32::NEG_INFINITY), Vec2::max);
+    target.canvas_rect = [
+        minimum.x,
+        target_canvas_h - maximum.y,
+        maximum.x - minimum.x,
+        maximum.y - minimum.y,
+    ];
+    let center = target_map.point(target_size * 0.5);
+    let render_size = Vec2::new(
+        target_size.x * target_x.length(),
+        target_size.y * target_y.length(),
+    );
+    target.canvas_render_rect = Some([
+        center.x - render_size.x * 0.5,
+        target_canvas_h - center.y - render_size.y * 0.5,
+        render_size.x,
+        render_size.y,
+    ]);
+    target.canvas_parent_basis = Some([
+        [target_parent.x.x, -target_parent.x.y],
+        [target_parent.y.x, -target_parent.y.y],
+    ]);
+    for (source_child, target_child) in source.children.iter().zip(&mut target.children) {
+        reflow_canvas_node(
+            source_child,
+            target_child,
+            source_size,
+            target_size,
+            source_map,
+            target_map,
+            source_canvas_h,
+            target_canvas_h,
+        );
+    }
+}
+
+/// Spawns a retained [`UiPanelFrame`] stage using the document's native CanvasScaler when configured.
 /// mounts `doc` inside it, returning `(stage_entity, BoundUiPanel)`.
 pub fn spawn_retained_panel_stage(
     parent: &mut ChildSpawnerCommands,
@@ -266,7 +517,14 @@ pub fn spawn_retained_panel_stage(
     let ref_w = doc.reference_width.max(64.0);
     let ref_h = doc.reference_height.max(64.0);
     let mut stage_opts = opts.clone();
-    stage_opts.fit_scale = fit_scale;
+    let frame_size = if let Some(viewport) = opts.viewport_size {
+        let metrics = compute_panel_canvas_metrics(doc, viewport, true);
+        stage_opts.fit_scale = metrics.scale;
+        metrics.frame_size
+    } else {
+        stage_opts.fit_scale = fit_scale;
+        Vec2::new(ref_w, ref_h) * fit_scale
+    };
     let mut bound_opt = None;
     let stage_e = parent
         .spawn((
@@ -278,8 +536,8 @@ pub fn spawn_retained_panel_stage(
             Pickable::IGNORE,
             Node {
                 position_type: PositionType::Relative,
-                width: Val::Px(ref_w * fit_scale),
-                height: Val::Px(ref_h * fit_scale),
+                width: Val::Px(frame_size.x),
+                height: Val::Px(frame_size.y),
                 overflow: Overflow::visible(),
                 ..default()
             },
@@ -340,10 +598,12 @@ pub struct BoundUiPanel {
     pub ref_h: f32,
     pub nodes: HashMap<String, Vec<Entity>>,
     pub by_path: HashMap<String, Entity>,
+    pub by_go_ref: HashMap<UiAssetRefDto, Entity>,
     pub text_nodes: HashMap<String, Vec<Entity>>,
     pub node_text_child: HashMap<Entity, Entity>,
     pub tex_handles: HashMap<String, Handle<Image>>,
     pub slots: HashMap<String, Vec<Option<Entity>>>,
+    pub controller_slots: HashMap<UiAssetRefDto, HashMap<String, Vec<Option<Entity>>>>,
     pub animator_entity: Option<Entity>,
 }
 
@@ -379,6 +639,21 @@ impl BoundUiPanel {
     /// Shortcut for `GameObjectData.GameObjects[idx]` (`SC.UI.View.Awake` slot lookup).
     pub fn game_object_slot(&self, idx: usize) -> Option<Entity> {
         self.slot("GameObjects", idx)
+    }
+
+    /// Looks up a field on a specific Unity controller component, including nested templates.
+    pub fn controller_slot(
+        &self,
+        controller: UiAssetRefDto,
+        field: &str,
+        idx: usize,
+    ) -> Option<Entity> {
+        self.controller_slots
+            .get(&controller)?
+            .get(field)?
+            .get(idx)
+            .copied()
+            .flatten()
     }
 
     /// Returns every entity matching `name` (in tree order).
@@ -487,6 +762,8 @@ impl BoundUiPanel {
 pub struct UiRetainedOptions {
     pub fullscreen: bool,
     pub fit_scale: f32,
+    /// Actual viewport for native CanvasScaler geometry at initial spawn.
+    pub viewport_size: Option<Vec2>,
     pub localize_text: bool,
     pub preview_mode: bool,
     pub hide_offscreen_nodes: bool,
@@ -504,6 +781,7 @@ impl Default for UiRetainedOptions {
         Self {
             fullscreen: false,
             fit_scale: 0.0,
+            viewport_size: None,
             localize_text: false,
             preview_mode: false,
             hide_offscreen_nodes: false,
@@ -588,7 +866,9 @@ pub fn apply_panel_default_view_rules(
                 .entry("txt_loding_name".to_owned())
                 .or_insert(loading_str);
             if let Some(t) = weighted_tip {
-                opts.text_overrides.entry("txt_tips".to_owned()).or_insert(t);
+                opts.text_overrides
+                    .entry("txt_tips".to_owned())
+                    .or_insert(t);
             }
         }
         "SettingPanel" => {
@@ -644,7 +924,12 @@ pub fn apply_panel_default_view_rules(
             }
         }
         "MainPanel" => {
-            for extra in ["m_posture_tip", "btn_Back_to_game", "btn_Gm", "btn_openserver"] {
+            for extra in [
+                "m_posture_tip",
+                "btn_Back_to_game",
+                "btn_Gm",
+                "btn_openserver",
+            ] {
                 opts.hidden_nodes.insert(extra.to_owned());
             }
         }
@@ -663,7 +948,10 @@ pub fn load_ui_panel_doc(rel_asset_path: &str) -> Result<UiPanelDoc, String> {
 
 /// Finds a mutable/immutable node DTO recursively by exact case-insensitive name.
 #[allow(dead_code)]
-pub fn find_panel_node_dto<'a>(node: &'a UiPanelNodeDto, target: &str) -> Option<&'a UiPanelNodeDto> {
+pub fn find_panel_node_dto<'a>(
+    node: &'a UiPanelNodeDto,
+    target: &str,
+) -> Option<&'a UiPanelNodeDto> {
     if node.name.eq_ignore_ascii_case(target) {
         return Some(node);
     }
@@ -809,7 +1097,15 @@ pub fn spawn_chrome_backdrop(
 
 /// Shared hover/press styling system for every Pure-Bevy [`UiPaletteButton`].
 pub fn style_palette_buttons(
-    mut buttons: Query<(&Hovered, Has<Pressed>, &UiPaletteButton, &mut BackgroundColor), With<Button>>,
+    mut buttons: Query<
+        (
+            &Hovered,
+            Has<Pressed>,
+            &UiPaletteButton,
+            &mut BackgroundColor,
+        ),
+        With<Button>,
+    >,
 ) {
     for (hovered, pressed, palette, mut bg) in &mut buttons {
         let color = match (pressed, hovered.get()) {
@@ -840,6 +1136,8 @@ pub fn compute_panel_fit_scale(ref_w: f32, ref_h: f32, win_size: Vec2, fullscree
 struct SpawnedAnimMeta {
     rest_anchored: [f32; 2],
     rest_rot_deg: f32,
+    rest_local_rot_deg: f32,
+    parent_basis: [[f32; 2]; 2],
     rest_scale: [f32; 2],
     rest_rgba: [f32; 4],
     rest_active: bool,
@@ -860,6 +1158,8 @@ struct BoundAnimTargetGroup {
     text_entity: Option<Entity>,
     rest_anchored: [f32; 2],
     rest_rot_deg: f32,
+    rest_local_rot_deg: f32,
+    parent_basis: [[f32; 2]; 2],
     rest_scale: [f32; 2],
     rest_rgba: [f32; 4],
     rest_active: bool,
@@ -882,7 +1182,7 @@ pub struct BoundUiAnimClip {
 pub struct UiPanelAnimator {
     pub frame_entity: Entity,
     pub clips: Vec<BoundUiAnimClip>,
-    pub active_clip: Option<usize>,
+    pub active_clips: Vec<usize>,
     pub elapsed_secs: f32,
     pub playing: bool,
     pub speed: f32,
@@ -892,13 +1192,34 @@ pub struct UiPanelAnimator {
 impl UiPanelAnimator {
     /// Plays a named animation clip (matching `AnimationClip::name`), resetting elapsed time.
     pub fn play_clip(&mut self, clip_name: &str, looping: bool) -> bool {
-        let Some(idx) = self.clips.iter().position(|c| c.name == clip_name) else {
+        self.play_clips(&[clip_name], looping)
+    }
+
+    /// Starts concurrent clips atomically, e.g. the native footer and chat transition pair.
+    pub fn play_clips(&mut self, names: &[&str], looping: bool) -> bool {
+        if !self.seek_clips(names, 0.0, true) {
             return false;
-        };
-        self.clips[idx].looping = looping;
-        self.active_clip = Some(idx);
+        }
+        for &idx in &self.active_clips {
+            self.clips[idx].looping = looping;
+        }
         self.elapsed_secs = 0.0;
         self.playing = true;
+        true
+    }
+
+    /// Restores a concurrent pose after a retained panel rebuild without replaying its transition.
+    pub fn seek_clips(&mut self, names: &[&str], elapsed_secs: f32, playing: bool) -> bool {
+        let Some(indices) = names
+            .iter()
+            .map(|name| self.clips.iter().position(|clip| clip.name == *name))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        self.active_clips = indices;
+        self.elapsed_secs = elapsed_secs.max(0.0);
+        self.playing = playing;
         true
     }
 }
@@ -933,7 +1254,7 @@ fn eval_ui_anim_scalar(times: &[f32], values: &[f32], t: f32) -> f32 {
 pub fn drive_ui_panel_animations(
     time: Res<Time>,
     mut animators: Query<&mut UiPanelAnimator>,
-    frame_q: Query<(&UiPanelFrame, &Node)>,
+    frame_q: Query<(&UiPanelFrame, &Node, Option<&UiPanelCanvasReflow>)>,
     mut ui_tf_q: Query<&mut UiTransform>,
     mut img_q: Query<&mut ImageNode>,
     mut text_color_q: Query<&mut TextColor>,
@@ -943,97 +1264,127 @@ pub fn drive_ui_panel_animations(
 ) {
     let dt = time.delta_secs();
     for mut animator in &mut animators {
-        let Some(clip_idx) = animator.active_clip else {
+        if animator.active_clips.is_empty() {
             continue;
-        };
+        }
         let frame_scale = frame_q
             .get(animator.frame_entity)
             .ok()
-            .and_then(|(frame, node)| match node.width {
-                Val::Px(w) if frame.ref_w > 1.0 => Some((w / frame.ref_w).clamp(0.1, 3.0)),
+            .and_then(|(frame, node, canvas)| match (canvas, node.width) {
+                (Some(canvas), _) => Some(canvas.scale),
+                (None, Val::Px(w)) if frame.ref_w > 1.0 => Some((w / frame.ref_w).clamp(0.1, 3.0)),
                 _ => None,
             })
             .unwrap_or(1.0);
 
-        let dur = animator.clips[clip_idx].duration_secs.max(0.0);
-        let looping = animator.clips[clip_idx].looping;
-        if animator.playing && dur > 1e-4 {
+        let dur = animator
+            .active_clips
+            .iter()
+            .map(|&idx| animator.clips[idx].duration_secs)
+            .fold(0.0_f32, f32::max);
+        let looping = animator
+            .active_clips
+            .iter()
+            .any(|&idx| animator.clips[idx].looping);
+        if animator.playing {
             animator.elapsed_secs += dt * animator.speed;
-            if looping {
-                animator.elapsed_secs %= dur;
-            } else if animator.elapsed_secs >= dur {
+            if !looping && animator.elapsed_secs >= dur {
                 animator.elapsed_secs = dur;
                 animator.playing = false;
             }
         }
-        let sample_t = if dur > 1e-4 {
-            animator.elapsed_secs.clamp(0.0, dur)
-        } else {
-            0.0
-        };
-
-        let clip = &animator.clips[clip_idx];
-        for grp in &clip.targets {
-            let mut pos_x = grp.rest_anchored[0];
-            let mut pos_y = grp.rest_anchored[1];
-            let mut rot_z_deg: Option<f32> = None;
-            let mut sx = grp.rest_scale[0];
-            let mut sy = grp.rest_scale[1];
-            let mut alpha: Option<f32> = None;
-            let mut active: Option<bool> = None;
-
-            for tr in &grp.tracks {
-                let v = eval_ui_anim_scalar(&tr.times, &tr.values, sample_t);
-                match tr.channel {
-                    UiAnimChannelDto::AnchoredPosX => pos_x = v,
-                    UiAnimChannelDto::AnchoredPosY => pos_y = v,
-                    UiAnimChannelDto::LocalEulerZDeg => rot_z_deg = Some(-v),
-                    UiAnimChannelDto::LocalScaleX => sx = v,
-                    UiAnimChannelDto::LocalScaleY => sy = v,
-                    UiAnimChannelDto::ColorAlpha => alpha = Some(v.clamp(0.0, 1.0)),
-                    UiAnimChannelDto::Active => active = Some(v >= 0.5),
-                    UiAnimChannelDto::SizeDeltaX | UiAnimChannelDto::SizeDeltaY => {}
+        for &clip_idx in &animator.active_clips {
+            let clip = &animator.clips[clip_idx];
+            let dur = clip.duration_secs.max(0.0);
+            let sample_t = if dur > 1e-4 {
+                if clip.looping {
+                    animator.elapsed_secs % dur
+                } else {
+                    animator.elapsed_secs.clamp(0.0, dur)
                 }
-            }
+            } else {
+                0.0
+            };
 
-            if grp.has_transform_track
-                && let Ok(mut tf) = ui_tf_q.get_mut(grp.entity)
-            {
-                let dx = (pos_x - grp.rest_anchored[0]) * frame_scale;
-                let dy = -(pos_y - grp.rest_anchored[1]) * frame_scale;
-                let rel_sx = sx / if grp.rest_scale[0].abs() > 1e-4 { grp.rest_scale[0] } else { 1.0 };
-                let rel_sy = sy / if grp.rest_scale[1].abs() > 1e-4 { grp.rest_scale[1] } else { 1.0 };
-                tf.translation = Val2::px(dx, dy);
-                tf.scale = Vec2::new(rel_sx, rel_sy);
-                tf.rotation = Rot2::degrees(rot_z_deg.unwrap_or(grp.rest_rot_deg));
-            }
+            for grp in &clip.targets {
+                let mut pos_x = grp.rest_anchored[0];
+                let mut pos_y = grp.rest_anchored[1];
+                let mut rot_z_deg: Option<f32> = None;
+                let mut sx = grp.rest_scale[0];
+                let mut sy = grp.rest_scale[1];
+                let mut alpha: Option<f32> = None;
+                let mut active: Option<bool> = None;
 
-            if let Some(a) = alpha {
-                let [r, g, b, _] = grp.rest_rgba;
-                let col = Color::srgba(r, g, b, a);
-                if let Ok(mut img) = img_q.get_mut(grp.entity) {
-                    img.color = col;
-                } else if let Some(tid) = grp.text_entity
-                    && let Ok(mut tc) = text_color_q.get_mut(tid)
+                for tr in &grp.tracks {
+                    let v = eval_ui_anim_scalar(&tr.times, &tr.values, sample_t);
+                    match tr.channel {
+                        UiAnimChannelDto::AnchoredPosX => pos_x = v,
+                        UiAnimChannelDto::AnchoredPosY => pos_y = v,
+                        UiAnimChannelDto::LocalEulerZDeg => rot_z_deg = Some(-v),
+                        UiAnimChannelDto::LocalScaleX => sx = v,
+                        UiAnimChannelDto::LocalScaleY => sy = v,
+                        UiAnimChannelDto::ColorAlpha => alpha = Some(v.clamp(0.0, 1.0)),
+                        UiAnimChannelDto::Active => active = Some(v >= 0.5),
+                        UiAnimChannelDto::SizeDeltaX | UiAnimChannelDto::SizeDeltaY => {}
+                    }
+                }
+
+                if grp.has_transform_track
+                    && let Ok(mut tf) = ui_tf_q.get_mut(grp.entity)
                 {
-                    tc.0 = col;
-                } else if let Ok(mut bg) = bg_q.get_mut(grp.entity) {
-                    bg.0 = col;
+                    let delta_x = pos_x - grp.rest_anchored[0];
+                    let delta_y = pos_y - grp.rest_anchored[1];
+                    let dx = (delta_x * grp.parent_basis[0][0] + delta_y * grp.parent_basis[1][0])
+                        * frame_scale;
+                    let dy = (delta_x * grp.parent_basis[0][1] + delta_y * grp.parent_basis[1][1])
+                        * frame_scale;
+                    let rel_sx = sx
+                        / if grp.rest_scale[0].abs() > 1e-4 {
+                            grp.rest_scale[0]
+                        } else {
+                            1.0
+                        };
+                    let rel_sy = sy
+                        / if grp.rest_scale[1].abs() > 1e-4 {
+                            grp.rest_scale[1]
+                        } else {
+                            1.0
+                        };
+                    tf.translation = Val2::px(dx, dy);
+                    tf.scale = Vec2::new(rel_sx, rel_sy);
+                    tf.rotation = Rot2::degrees(
+                        grp.rest_rot_deg
+                            + rot_z_deg.map_or(0.0, |rotation| rotation - grp.rest_local_rot_deg),
+                    );
                 }
-            }
 
-            if let Some(is_on) = active
-                && (grp.rest_active || is_on)
-            {
-                if let Ok(mut vis) = vis_q.get_mut(grp.entity) {
-                    *vis = if is_on {
-                        Visibility::Inherited
-                    } else {
-                        Visibility::Hidden
-                    };
+                if let Some(a) = alpha {
+                    let [r, g, b, _] = grp.rest_rgba;
+                    let col = Color::srgba(r, g, b, a);
+                    if let Ok(mut img) = img_q.get_mut(grp.entity) {
+                        img.color = col;
+                    } else if let Some(tid) = grp.text_entity
+                        && let Ok(mut tc) = text_color_q.get_mut(tid)
+                    {
+                        tc.0 = col;
+                    } else if let Ok(mut bg) = bg_q.get_mut(grp.entity) {
+                        bg.0 = col;
+                    }
                 }
-                if let Ok(mut n) = node_q.get_mut(grp.entity) {
-                    n.display = if is_on { Display::Flex } else { Display::None };
+
+                if let Some(is_on) = active
+                    && (grp.rest_active || is_on)
+                {
+                    if let Ok(mut vis) = vis_q.get_mut(grp.entity) {
+                        *vis = if is_on {
+                            Visibility::Inherited
+                        } else {
+                            Visibility::Hidden
+                        };
+                    }
+                    if let Ok(mut n) = node_q.get_mut(grp.entity) {
+                        n.display = if is_on { Display::Flex } else { Display::None };
+                    }
                 }
             }
         }
@@ -1072,6 +1423,46 @@ pub fn spawn_retained_panel_into(
     font_source: &FontSource,
     opts: &UiRetainedOptions,
 ) -> BoundUiPanel {
+    let source_doc = doc.clone();
+    let mut spawn_doc = source_doc.clone();
+    let mut spawn_opts = opts.clone();
+    let native_canvas = opts.fullscreen && doc.scale_mode == "scale_with_screen_size";
+    let metrics = opts
+        .viewport_size
+        .map(|viewport| compute_panel_canvas_metrics(doc, viewport, opts.fullscreen));
+    if let Some(metrics) = metrics {
+        spawn_opts.fit_scale = metrics.scale;
+        if native_canvas {
+            spawn_doc = reflow_panel_doc(doc, metrics.canvas_size);
+        }
+    }
+    let doc = &spawn_doc;
+    let opts = &spawn_opts;
+    let frame_entity = frame.target_entity();
+    if native_canvas {
+        let canvas_size = Vec2::new(doc.reference_width, doc.reference_height);
+        let scale = metrics.map_or(opts.fit_scale.max(0.1), |metrics| metrics.scale);
+        frame.commands().entity(frame_entity).insert((
+            UiPanelFrame {
+                ref_w: source_doc.reference_width,
+                ref_h: source_doc.reference_height,
+                fullscreen: true,
+            },
+            UiPanelCanvasReflow {
+                source: source_doc,
+                canvas_size,
+                scale,
+            },
+        ));
+        if let Some(metrics) = metrics {
+            frame.commands().queue(move |world: &mut World| {
+                if let Some(mut node) = world.get_mut::<Node>(frame_entity) {
+                    node.width = Val::Px(metrics.frame_size.x);
+                    node.height = Val::Px(metrics.frame_size.y);
+                }
+            });
+        }
+    }
     let ref_w = doc.reference_width.max(64.0);
     let ref_h = doc.reference_height.max(64.0);
     let mut tex_handles: HashMap<String, Handle<Image>> = HashMap::new();
@@ -1093,6 +1484,8 @@ pub fn spawn_retained_panel_into(
         ..default()
     };
 
+    let mut node_indices = HashMap::new();
+    collect_canvas_node_indices(&doc.root, &mut Vec::new(), &mut node_indices);
     let ctx = RetainedSpawnCtx {
         panel_name: &doc.name,
         ref_w,
@@ -1102,6 +1495,9 @@ pub fn spawn_retained_panel_into(
         tex_handles: &tex_handles,
         tex_dims: &tex_dims,
         opts,
+        frame_entity,
+        node_indices: &node_indices,
+        native_canvas,
     };
 
     let mut anim_meta: HashMap<Entity, SpawnedAnimMeta> = HashMap::new();
@@ -1113,24 +1509,13 @@ pub fn spawn_retained_panel_into(
         [0.0, 0.0, ref_w, ref_h],
         false,
         None,
+        None,
         &ctx,
         &mut bound,
         &mut anim_meta,
     );
 
-    // Populate `GameObjectData` / MonoBehaviour slot bindings (`GameObjects[0..N]`).
-    for binding in &doc.script_bindings {
-        let target_e = bound.first(&binding.target_name);
-        let slot_list = bound.slots.entry(binding.field_name.clone()).or_default();
-        if let Some(idx) = binding.slot_index {
-            if slot_list.len() <= idx {
-                slot_list.resize(idx + 1, None);
-            }
-            slot_list[idx] = target_e;
-        } else {
-            slot_list.push(target_e);
-        }
-    }
+    bind_panel_scripts(&mut bound, doc);
 
     if opts.animate && !doc.animations.is_empty() {
         let mut transform_entities = HashSet::new();
@@ -1182,6 +1567,8 @@ pub fn spawn_retained_panel_into(
                         text_entity: bound.node_text_child.get(&e).copied(),
                         rest_anchored: meta.rest_anchored,
                         rest_rot_deg: meta.rest_rot_deg,
+                        rest_local_rot_deg: meta.rest_local_rot_deg,
+                        parent_basis: meta.parent_basis,
                         rest_scale: meta.rest_scale,
                         rest_rgba: meta.rest_rgba,
                         rest_active: meta.rest_active,
@@ -1210,16 +1597,21 @@ pub fn spawn_retained_panel_into(
                         .try_insert(UiTransform::from_rotation(Rot2::degrees(meta.rest_rot_deg)));
                 }
             }
-            let active_clip = clips.iter().position(|c| c.looping);
+            let active_clips = clips
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, clip)| clip.looping.then_some(idx))
+                .collect::<Vec<_>>();
+            let playing = !active_clips.is_empty();
             let anim_entity = frame
                 .spawn((
                     Name::new("UiPanelAnimator"),
                     UiPanelAnimator {
                         frame_entity: frame.target_entity(),
                         clips,
-                        active_clip,
+                        active_clips,
                         elapsed_secs: 0.0,
-                        playing: active_clip.is_some(),
+                        playing,
                         speed: 1.0,
                     },
                 ))
@@ -1231,6 +1623,57 @@ pub fn spawn_retained_panel_into(
     bound
 }
 
+fn bind_panel_scripts(bound: &mut BoundUiPanel, doc: &UiPanelDoc) {
+    fn write_slot(
+        slots: &mut HashMap<String, Vec<Option<Entity>>>,
+        binding: &UiScriptBindingDto,
+        target: Option<Entity>,
+        replace: bool,
+    ) {
+        let list = slots.entry(binding.field_name.clone()).or_default();
+        if let Some(idx) = binding.slot_index {
+            let new_slot = idx >= list.len();
+            if new_slot {
+                list.resize(idx + 1, None);
+            }
+            if replace || new_slot {
+                list[idx] = target;
+            }
+        } else {
+            list.push(target);
+        }
+    }
+
+    for binding in &doc.script_bindings {
+        let target = if let Some(go_ref) = binding.target_go_ref {
+            // A skipped inactive target stays unbound; a same-named active sibling is different.
+            bound.by_go_ref.get(&go_ref).copied()
+        } else if let Some(ref path) = binding.target_path {
+            bound.by_path.get(path).copied()
+        } else {
+            bound.first(&binding.target_name)
+        };
+        if let Some(controller) = binding.owner_component_ref {
+            write_slot(
+                bound.controller_slots.entry(controller).or_default(),
+                binding,
+                target,
+                true,
+            );
+        }
+        let is_root = if let Some(owner) = binding.owner_go_ref {
+            Some(owner) == doc.root.go_ref
+        } else {
+            binding.owner_path.as_deref() == Some("")
+        };
+        let legacy = binding.owner_go_ref.is_none() && binding.owner_path.is_none();
+        if is_root || legacy {
+            // View.Awake reads the root GameObjectData array; nested widgets own separate arrays.
+            write_slot(&mut bound.slots, binding, target, is_root);
+        }
+    }
+}
+
 struct RetainedSpawnCtx<'a> {
     panel_name: &'a str,
     ref_w: f32,
@@ -1240,6 +1683,22 @@ struct RetainedSpawnCtx<'a> {
     tex_handles: &'a HashMap<String, Handle<Image>>,
     tex_dims: &'a HashMap<String, [u32; 2]>,
     opts: &'a UiRetainedOptions,
+    frame_entity: Entity,
+    node_indices: &'a HashMap<usize, Vec<usize>>,
+    native_canvas: bool,
+}
+
+fn collect_canvas_node_indices(
+    node: &UiPanelNodeDto,
+    indices: &mut Vec<usize>,
+    result: &mut HashMap<usize, Vec<usize>>,
+) {
+    result.insert(node as *const UiPanelNodeDto as usize, indices.clone());
+    for (index, child) in node.children.iter().enumerate() {
+        indices.push(index);
+        collect_canvas_node_indices(child, indices, result);
+        indices.pop();
+    }
 }
 
 struct DeferredTextSpawn {
@@ -1257,6 +1716,35 @@ fn is_generic_child_hitbox_name(name: &str) -> bool {
     ) || name.starts_with("Image (")
 }
 
+fn scroll_viewport_index(node: &UiPanelNodeDto) -> Option<usize> {
+    (node.widget_kind.as_deref() == Some("ScrollRect"))
+        .then(|| {
+            node.children
+                .iter()
+                .position(|child| child.name.eq_ignore_ascii_case("viewport"))
+        })
+        .flatten()
+}
+
+fn scroll_overflow([horizontal, vertical]: [bool; 2]) -> Overflow {
+    Overflow {
+        x: if horizontal {
+            OverflowAxis::Scroll
+        } else {
+            OverflowAxis::Clip
+        },
+        y: if vertical {
+            OverflowAxis::Scroll
+        } else {
+            OverflowAxis::Clip
+        },
+    }
+}
+
+fn canvas_rotation(node: &UiPanelNodeDto) -> f32 {
+    node.canvas_rotation_z_deg.unwrap_or(node.rotation_z_deg)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_retained_node_recursive(
     parent: &mut ChildSpawnerCommands,
@@ -1266,6 +1754,7 @@ fn spawn_retained_node_recursive(
     parent_rect: [f32; 4],
     parent_forced: bool,
     inherited_button_name: Option<&str>,
+    inherited_scroll_axes: Option<[bool; 2]>,
     ctx: &RetainedSpawnCtx<'_>,
     bound: &mut BoundUiPanel,
     anim_meta: &mut HashMap<Entity, SpawnedAnimMeta>,
@@ -1280,13 +1769,23 @@ fn spawn_retained_node_recursive(
         && ctx.opts.hide_offscreen_nodes
         && !forced_here
         && !subtree_intersects_canvas(node, ctx.ref_w, ctx.ref_h);
-    let hidden_here =
-        ctx.opts.hidden_nodes.contains(&node.name) || zero_scaled || offscreen_hidden;
+    let hidden_here = ctx.opts.hidden_nodes.contains(&node.name) || zero_scaled || offscreen_hidden;
     let [px, py, pw, ph] = parent_rect;
     let orig_rect = node.canvas_rect;
     let [orig_x, orig_y, orig_w, orig_h] = orig_rect;
+    let [art_x, art_y, art_w, art_h] = node.canvas_render_rect.unwrap_or(orig_rect);
     let has_sized_rect = orig_w >= 1.0 && orig_h >= 1.0;
     let is_text_leaf = matches!(node.graphic, Some(UiPanelGraphicDto::Text { .. }));
+    let scroll_axes = (node.widget_kind.as_deref() == Some("ScrollRect")).then(|| {
+        node.widget_props
+            .as_ref()
+            .and_then(|props| props.scroll_hv)
+            .unwrap_or([false, true])
+    });
+    let viewport_index = scroll_viewport_index(node);
+    // Unity scrolls Content inside its Viewport, leaving the viewport and scrollbars fixed.
+    let scroll_here =
+        inherited_scroll_axes.or_else(|| scroll_axes.filter(|_| viewport_index.is_none()));
 
     // Compute preserve_aspect box separately so child coordinates stay anchored to `orig_rect`.
     let mut aspect_box: Option<[f32; 4]> = None;
@@ -1300,16 +1799,16 @@ fn spawn_retained_node_recursive(
         && th > 0
     {
         let tex_ratio = tw as f32 / th as f32;
-        let box_ratio = orig_w / orig_h;
+        let box_ratio = art_w / art_h.max(1e-4);
         if (box_ratio - tex_ratio).abs() > 0.01 {
             let (new_w, new_h) = if box_ratio > tex_ratio {
-                (orig_h * tex_ratio, orig_h)
+                (art_h * tex_ratio, art_h)
             } else {
-                (orig_w, orig_w / tex_ratio)
+                (art_w, art_w / tex_ratio)
             };
             aspect_box = Some([
-                orig_x + (orig_w - new_w) * 0.5,
-                orig_y + (orig_h - new_h) * 0.5,
+                art_x + (art_w - new_w) * 0.5,
+                art_y + (art_h - new_h) * 0.5,
                 new_w,
                 new_h,
             ]);
@@ -1338,7 +1837,7 @@ fn spawn_retained_node_recursive(
     };
 
     let (box_x, box_y, box_w, box_h) = if node.children.is_empty()
-        && let Some(ab) = aspect_box
+        && let Some(ab) = aspect_box.or(node.canvas_render_rect)
     {
         (ab[0], ab[1], ab[2], ab[3])
     } else {
@@ -1347,8 +1846,8 @@ fn spawn_retained_node_recursive(
 
     let (layout_node, next_parent_rect) = if has_sized_rect {
         let mut overflow = Overflow::visible();
-        if node.widget_kind.as_deref() == Some("ScrollRect") {
-            overflow = Overflow::scroll_y();
+        if let Some(axes) = scroll_here {
+            overflow = scroll_overflow(axes);
         } else if node.clips_children {
             overflow = Overflow::clip();
         }
@@ -1381,14 +1880,23 @@ fn spawn_retained_node_recursive(
             orig_rect,
         )
     } else {
-        let collapse_empty = (orig_w < 0.5 && orig_h < 0.5) && (zero_scaled || node.children.is_empty());
+        let collapse_empty =
+            (orig_w < 0.5 && orig_h < 0.5) && (zero_scaled || node.children.is_empty());
         (
             Node {
                 position_type: PositionType::Absolute,
                 left: Val::Px(0.0),
                 top: Val::Px(0.0),
-                width: if collapse_empty { Val::Px(0.0) } else { Val::Percent(100.0) },
-                height: if collapse_empty { Val::Px(0.0) } else { Val::Percent(100.0) },
+                width: if collapse_empty {
+                    Val::Px(0.0)
+                } else {
+                    Val::Percent(100.0)
+                },
+                height: if collapse_empty {
+                    Val::Px(0.0)
+                } else {
+                    Val::Percent(100.0)
+                },
                 display: if hidden_here || collapse_empty {
                     Display::None
                 } else {
@@ -1411,18 +1919,33 @@ fn spawn_retained_node_recursive(
         },
     ));
     let node_entity = entity_cmd.id();
+    if ctx.native_canvas {
+        entity_cmd.insert(UiRetainedCanvasNode {
+            frame: ctx.frame_entity,
+            indices: ctx.node_indices[&(node as *const UiPanelNodeDto as usize)].clone(),
+            artwork_child: false,
+        });
+    }
     bound
         .nodes
         .entry(node.name.clone())
         .or_default()
         .push(node_entity);
-    bound.by_path.entry(rel_path.to_owned()).or_insert(node_entity);
-
-    // Apply local rotation only to leaf widgets so pre-solved container hierarchies are never inverted.
-    if node.children.is_empty() && node.rotation_z_deg.abs() > 0.25 {
-        entity_cmd.insert(UiTransform::from_rotation(Rot2::degrees(-node.rotation_z_deg)));
+    bound
+        .by_path
+        .entry(rel_path.to_owned())
+        .or_insert(node_entity);
+    if let Some(go_ref) = node.go_ref {
+        bound.by_go_ref.insert(go_ref, node_entity);
     }
-    if node.widget_kind.as_deref() == Some("ScrollRect") {
+
+    // Artwork uses the cumulative canvas angle; the container hierarchy uses already-solved AABBs.
+    if node.children.is_empty() && canvas_rotation(node).abs() > 0.25 {
+        entity_cmd.insert(UiTransform::from_rotation(Rot2::degrees(canvas_rotation(
+            node,
+        ))));
+    }
+    if scroll_here.is_some_and(|axes| axes[0] || axes[1]) {
         entity_cmd.insert((
             UiScrollArea { speed_px: 1.0 },
             Hovered::default(),
@@ -1455,8 +1978,10 @@ fn spawn_retained_node_recursive(
                     let alpha = (color[3] * node.effective_alpha).clamp(0.0, 1.0);
                     if alpha > 0.004 {
                         base_tint = Color::srgba(color[0], color[1], color[2], alpha);
-                        let tex_handle =
-                            texture_key.as_deref().and_then(|k| ctx.tex_handles.get(k)).cloned();
+                        let tex_handle = texture_key
+                            .as_deref()
+                            .and_then(|k| ctx.tex_handles.get(k))
+                            .cloned();
                         let img_node = tex_handle.map(|h| {
                             let mut img = ImageNode::new(h).with_color(base_tint);
                             img.flip_x = node.flip_x;
@@ -1495,7 +2020,9 @@ fn spawn_retained_node_recursive(
                             && orig_w > 48.0
                             && orig_h > 48.0;
                         if let Some(img) = img_node {
-                            if !node.children.is_empty() && let Some(ab) = aspect_box {
+                            if !node.children.is_empty()
+                                && let Some(ab) = aspect_box
+                            {
                                 deferred_aspect_img = Some((ab, img));
                             } else {
                                 entity_cmd.insert(img);
@@ -1527,8 +2054,10 @@ fn spawn_retained_node_recursive(
                     let alpha = (color[3] * node.effective_alpha).clamp(0.0, 1.0);
                     if alpha > 0.004 {
                         base_tint = Color::srgba(color[0], color[1], color[2], alpha);
-                        let tex_handle =
-                            texture_key.as_deref().and_then(|k| ctx.tex_handles.get(k)).cloned();
+                        let tex_handle = texture_key
+                            .as_deref()
+                            .and_then(|k| ctx.tex_handles.get(k))
+                            .cloned();
                         if let Some(h) = tex_handle {
                             let mut img = ImageNode::new(h).with_color(base_tint);
                             img.flip_x = node.flip_x;
@@ -1536,7 +2065,8 @@ fn spawn_retained_node_recursive(
                             img.image_mode = NodeImageMode::Stretch;
                             entity_cmd.insert(img);
                         } else if *missing_texture {
-                            entity_cmd.insert(BackgroundColor(Color::srgba(0.18, 0.55, 0.85, 0.08)));
+                            entity_cmd
+                                .insert(BackgroundColor(Color::srgba(0.18, 0.55, 0.85, 0.08)));
                         }
                     }
                 }
@@ -1584,7 +2114,8 @@ fn spawn_retained_node_recursive(
                         if char_count > 6 && orig_w > 40.0 {
                             let est_width = char_count as f32 * base_px * 0.52;
                             if est_width > orig_w * 1.15 && orig_h < base_px * 2.4 {
-                                let shrink = ((orig_w * 1.05) / (char_count as f32 * 0.52)).max(9.5);
+                                let shrink =
+                                    ((orig_w * 1.05) / (char_count as f32 * 0.52)).max(9.5);
                                 base_px = base_px.min(shrink);
                             }
                         }
@@ -1658,7 +2189,7 @@ fn spawn_retained_node_recursive(
         {
             entity_cmd.insert(UiSelectableColors::from_unity_block(colors, base_tint));
         }
-    } else if node.widget_kind.as_deref() != Some("ScrollRect") {
+    } else if !scroll_here.is_some_and(|axes| axes[0] || axes[1]) {
         entity_cmd.insert(Pickable::IGNORE);
     }
 
@@ -1674,10 +2205,14 @@ fn spawn_retained_node_recursive(
         SpawnedAnimMeta {
             rest_anchored: node.anchored_position,
             rest_rot_deg: if node.children.is_empty() {
-                -node.rotation_z_deg
+                canvas_rotation(node)
             } else {
                 0.0
             },
+            rest_local_rot_deg: node.rotation_z_deg,
+            parent_basis: node
+                .canvas_parent_basis
+                .unwrap_or([[1.0, 0.0], [0.0, -1.0]]),
             rest_scale: [node.scale[0], node.scale[1]],
             rest_rgba,
             rest_active: !hidden_here,
@@ -1690,7 +2225,7 @@ fn spawn_retained_node_recursive(
         let mut text_child_id = None;
         entity_cmd.with_children(|ch_spawner| {
             if let Some((ab, img)) = deferred_aspect_img {
-                ch_spawner.spawn((
+                let mut artwork = ch_spawner.spawn((
                     Pickable::IGNORE,
                     img,
                     Node {
@@ -1702,11 +2237,21 @@ fn spawn_retained_node_recursive(
                         ..default()
                     },
                 ));
+                if ctx.native_canvas {
+                    artwork.insert(UiRetainedCanvasNode {
+                        frame: ctx.frame_entity,
+                        indices: ctx.node_indices[&(node as *const UiPanelNodeDto as usize)]
+                            .clone(),
+                        artwork_child: true,
+                    });
+                }
             }
             if let Some(dt) = deferred_text {
                 let mut tc = ch_spawner.spawn((
                     Pickable::IGNORE,
-                    UiPanelScaledText { base_px: dt.base_px },
+                    UiPanelScaledText {
+                        base_px: dt.base_px,
+                    },
                     Node {
                         max_width: Val::Percent(100.0),
                         ..default()
@@ -1728,7 +2273,7 @@ fn spawn_retained_node_recursive(
                 }
                 text_child_id = Some(tc.id());
             }
-            for child in &node.children {
+            for (child_idx, child) in node.children.iter().enumerate() {
                 let child_path = if is_root {
                     child.name.clone()
                 } else {
@@ -1742,6 +2287,7 @@ fn spawn_retained_node_recursive(
                     next_parent_rect,
                     forced_here,
                     next_inherited_button_name,
+                    scroll_axes.filter(|_| viewport_index == Some(child_idx)),
                     ctx,
                     bound,
                     anim_meta,
@@ -1749,7 +2295,11 @@ fn spawn_retained_node_recursive(
             }
         });
         if let Some(tid) = text_child_id {
-            bound.text_nodes.entry(node_name_clone).or_default().push(tid);
+            bound
+                .text_nodes
+                .entry(node_name_clone)
+                .or_default()
+                .push(tid);
             bound.node_text_child.insert(node_entity, tid);
         }
     }
@@ -1921,7 +2471,13 @@ pub fn spawn_ui_panel_preview(
 /// Resizes preview & stage [`UiPanelFrame`] entities and scaled font sizes smoothly on window resize.
 pub fn resize_ui_panel_frames(
     windows: Query<&Window>,
-    mut frame_q: Query<(Entity, &UiPanelFrame, &mut Node)>,
+    mut frame_q: Query<(
+        Entity,
+        &UiPanelFrame,
+        Option<&mut UiPanelCanvasReflow>,
+        &mut Node,
+    )>,
+    mut retained_nodes: Query<(&UiRetainedCanvasNode, &mut Node), Without<UiPanelFrame>>,
     children_q: Query<&Children>,
     mut text_q: Query<(&UiPanelScaledText, &mut TextFont)>,
 ) {
@@ -1929,12 +2485,95 @@ pub fn resize_ui_panel_frames(
         return;
     };
     let win_size = Vec2::new(win.width(), win.height());
-    for (frame_e, frame, mut node) in &mut frame_q {
-        let scale = compute_panel_fit_scale(frame.ref_w, frame.ref_h, win_size, frame.fullscreen);
-        node.width = Val::Px(frame.ref_w * scale);
-        node.height = Val::Px(frame.ref_h * scale);
+    for (frame_e, frame, canvas, mut node) in &mut frame_q {
+        let scale = if let Some(mut canvas) = canvas {
+            let metrics = compute_panel_canvas_metrics(&canvas.source, win_size, frame.fullscreen);
+            node.width = Val::Px(metrics.frame_size.x);
+            node.height = Val::Px(metrics.frame_size.y);
+            canvas.scale = metrics.scale;
+            if !canvas.canvas_size.abs_diff_eq(metrics.canvas_size, 0.01) {
+                let doc = reflow_panel_doc(&canvas.source, metrics.canvas_size);
+                for (binding, mut retained) in &mut retained_nodes {
+                    if binding.frame != frame_e {
+                        continue;
+                    }
+                    let (source_node, parent_rect) =
+                        canvas_node_and_parent_rect(&doc, &binding.indices);
+                    let artwork = canvas_artwork_rect(source_node, &doc.textures);
+                    let rectangle = if binding.artwork_child {
+                        artwork
+                    } else if source_node.children.is_empty() {
+                        artwork
+                    } else {
+                        source_node.canvas_rect
+                    };
+                    let parent_rect = if binding.artwork_child {
+                        source_node.canvas_rect
+                    } else {
+                        parent_rect
+                    };
+                    if source_node.canvas_rect[2] >= 1.0 && source_node.canvas_rect[3] >= 1.0 {
+                        retained.left = Val::Percent(
+                            (rectangle[0] - parent_rect[0]) / parent_rect[2].max(1.0) * 100.0,
+                        );
+                        retained.top = Val::Percent(
+                            (rectangle[1] - parent_rect[1]) / parent_rect[3].max(1.0) * 100.0,
+                        );
+                        retained.width =
+                            Val::Percent(rectangle[2] / parent_rect[2].max(1.0) * 100.0);
+                        retained.height =
+                            Val::Percent(rectangle[3] / parent_rect[3].max(1.0) * 100.0);
+                    }
+                }
+                canvas.canvas_size = metrics.canvas_size;
+            }
+            metrics.scale
+        } else {
+            let scale =
+                compute_panel_fit_scale(frame.ref_w, frame.ref_h, win_size, frame.fullscreen);
+            node.width = Val::Px(frame.ref_w * scale);
+            node.height = Val::Px(frame.ref_h * scale);
+            scale
+        };
         rescale_texts_under(frame_e, scale, &children_q, &mut text_q);
     }
+}
+
+fn canvas_node_and_parent_rect<'a>(
+    doc: &'a UiPanelDoc,
+    indices: &[usize],
+) -> (&'a UiPanelNodeDto, [f32; 4]) {
+    let mut node = &doc.root;
+    let mut parent_rect = [0.0, 0.0, doc.reference_width, doc.reference_height];
+    for &index in indices {
+        if node.canvas_rect[2] >= 1.0 && node.canvas_rect[3] >= 1.0 {
+            parent_rect = node.canvas_rect;
+        }
+        node = &node.children[index];
+    }
+    (node, parent_rect)
+}
+
+fn canvas_artwork_rect(node: &UiPanelNodeDto, textures: &[UiTextureDto]) -> [f32; 4] {
+    let mut art = node.canvas_render_rect.unwrap_or(node.canvas_rect);
+    if let Some(UiPanelGraphicDto::Image {
+        preserve_aspect: true,
+        texture_key: Some(key),
+        ..
+    }) = &node.graphic
+        && let Some(texture) = textures
+            .iter()
+            .find(|texture| texture.key == *key && texture.height > 0 && texture.width > 0)
+    {
+        let ratio = texture.width as f32 / texture.height as f32;
+        let width = art[2].min(art[3] * ratio);
+        let height = art[3].min(art[2] / ratio);
+        art[0] += (art[2] - width) * 0.5;
+        art[1] += (art[3] - height) * 0.5;
+        art[2] = width;
+        art[3] = height;
+    }
+    art
 }
 
 fn rescale_texts_under(
@@ -2008,10 +2647,397 @@ pub fn strip_rich_text_tags(input: &str) -> String {
 mod tests {
     use super::*;
 
+    fn panel_node<'a>(root: &'a UiPanelNodeDto, path: &[&str]) -> &'a UiPanelNodeDto {
+        path.iter().fold(root, |node, name| {
+            node.children
+                .iter()
+                .find(|child| child.name == *name)
+                .unwrap()
+        })
+    }
+
+    #[test]
+    fn real_main_panel_canvas_scaler_preserves_header_anchors_across_aspects() {
+        let source = load_ui_panel_doc("ui_panels/MainPanel.json").unwrap();
+        assert_eq!(source.scale_mode, "scale_with_screen_size");
+        assert_eq!(source.match_width_or_height, 0.5);
+        for viewport in [
+            Vec2::new(1920.0, 1080.0),
+            Vec2::new(1920.0, 1006.0),
+            Vec2::new(2560.0, 1080.0),
+            Vec2::new(1280.0, 1024.0),
+        ] {
+            let metrics = compute_panel_canvas_metrics(&source, viewport, true);
+            let expected_scale = ((viewport.x / 1920.0) * (viewport.y / 1080.0)).sqrt();
+            assert!((metrics.scale - expected_scale).abs() < 0.00001);
+            assert_eq!(metrics.frame_size, viewport);
+            let doc = reflow_panel_doc(&source, metrics.canvas_size);
+            let avatar = panel_node(&doc.root, &["m_ding", "zuo", "head", "head", "m_head_icon"]);
+            assert!(
+                (avatar.canvas_rect[0] * metrics.scale - 44.700012 * expected_scale).abs() < 0.05
+            );
+            assert!(
+                (avatar.canvas_rect[1] * metrics.scale - 17.599976 * expected_scale).abs() < 0.05
+            );
+            let right = panel_node(&doc.root, &["m_ding", "you"]);
+            assert!(
+                ((right.canvas_rect[0] + right.canvas_rect[2]) * metrics.scale - viewport.x).abs()
+                    < 0.05
+            );
+            let gold = panel_node(&doc.root, &["m_ding", "zuo", "money", "jinbi", "txt_gold"]);
+            assert!(
+                (gold.canvas_rect[0] * metrics.scale - 1265.1019 * expected_scale).abs() < 0.05
+            );
+            let down = panel_node(&doc.root, &["down"]);
+            assert!(
+                (down.canvas_rect[1] * metrics.scale - (viewport.y - 81.0 * metrics.scale)).abs()
+                    < 0.05
+            );
+            assert_eq!(down.canvas_rotation_z_deg, Some(-180.0));
+        }
+        let baseline = reflow_panel_doc(&source, Vec2::new(1920.0, 1080.0));
+        fn compare(source: &UiPanelNodeDto, actual: &UiPanelNodeDto) {
+            for (expected, actual) in source.canvas_rect.into_iter().zip(actual.canvas_rect) {
+                assert!(
+                    (expected - actual).abs() < 0.05,
+                    "{} baseline geometry",
+                    source.name
+                );
+            }
+            for (source, actual) in source.children.iter().zip(&actual.children) {
+                compare(source, actual);
+            }
+        }
+        compare(&source.root, &baseline.root);
+    }
+
+    #[test]
+    fn retained_main_panel_reflows_existing_nodes_on_live_resize() {
+        let mut source = load_ui_panel_doc("ui_panels/MainPanel.json").unwrap();
+        source.textures.clear();
+        source.animations.clear();
+        fn geometry_only(node: &mut UiPanelNodeDto) {
+            node.graphic = None;
+            node.is_interactive = false;
+            for child in &mut node.children {
+                geometry_only(child);
+            }
+        }
+        geometry_only(&mut source.root);
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .add_systems(Update, resize_ui_panel_frames)
+            .add_systems(
+                Startup,
+                move |mut commands: Commands, assets: Res<AssetServer>| {
+                    let host = commands.spawn(Node::default()).id();
+                    commands.entity(host).with_children(|root| {
+                        let bound = spawn_retained_panel_into(
+                            root,
+                            &source,
+                            &assets,
+                            None,
+                            &FontSource::sans_serif(),
+                            &UiRetainedOptions {
+                                fullscreen: true,
+                                viewport_size: Some(Vec2::new(1920.0, 1080.0)),
+                                ..default()
+                            },
+                        );
+                        root.commands().entity(host).insert(bound);
+                    });
+                },
+            );
+        let window = app
+            .world_mut()
+            .spawn(Window {
+                resolution: (1920, 1080).into(),
+                ..default()
+            })
+            .id();
+        app.update();
+        let (host, avatar) = {
+            let mut panels = app.world_mut().query::<(Entity, &BoundUiPanel)>();
+            let (host, bound) = panels.single(app.world()).unwrap();
+            (host, bound.first("m_head_icon").unwrap())
+        };
+        fn live_rect(world: &World, entity: Entity) -> [f32; 4] {
+            let node = world.get::<Node>(entity).unwrap();
+            let parent = world
+                .get::<ChildOf>(entity)
+                .map(|parent| live_rect(world, parent.parent()))
+                .unwrap_or([0.0, 0.0, 0.0, 0.0]);
+            let value = |value, parent| match value {
+                Val::Px(value) => value,
+                Val::Percent(value) => value * parent * 0.01,
+                _ => 0.0,
+            };
+            [
+                parent[0] + value(node.left, parent[2]),
+                parent[1] + value(node.top, parent[3]),
+                value(node.width, parent[2]),
+                value(node.height, parent[3]),
+            ]
+        }
+        assert!((live_rect(app.world(), avatar)[0] - 44.700012).abs() < 0.05);
+        for viewport in [Vec2::new(1920.0, 1006.0), Vec2::new(2560.0, 1080.0)] {
+            app.world_mut()
+                .get_mut::<Window>(window)
+                .unwrap()
+                .resolution
+                .set(viewport.x, viewport.y);
+            app.update();
+            let scale = ((viewport.x / 1920.0) * (viewport.y / 1080.0)).sqrt();
+            assert!((live_rect(app.world(), avatar)[0] - 44.700012 * scale).abs() < 0.05);
+            assert_eq!(
+                app.world().get::<Node>(host).unwrap().width,
+                Val::Px(viewport.x)
+            );
+            assert!(app.world().get::<UiRetainedCanvasNode>(avatar).is_some());
+        }
+    }
+
+    #[test]
+    fn concurrent_ui_clips_sample_each_target_in_its_native_parent_basis() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_systems(Update, drive_ui_panel_animations);
+        let frame = app
+            .world_mut()
+            .spawn((
+                UiPanelFrame {
+                    ref_w: 1920.0,
+                    ref_h: 1080.0,
+                    fullscreen: true,
+                },
+                Node {
+                    width: Val::Px(960.0),
+                    ..default()
+                },
+            ))
+            .id();
+        let footer = app.world_mut().spawn(UiTransform::default()).id();
+        let chat = app.world_mut().spawn(UiTransform::default()).id();
+        let clip = |name: &str, entity, parent_basis| BoundUiAnimClip {
+            name: name.into(),
+            duration_secs: 1.0,
+            looping: false,
+            targets: vec![BoundAnimTargetGroup {
+                entity,
+                text_entity: None,
+                rest_anchored: [0.0, 0.0],
+                rest_rot_deg: 0.0,
+                rest_local_rot_deg: 0.0,
+                parent_basis,
+                rest_scale: [1.0, 1.0],
+                rest_rgba: [1.0; 4],
+                rest_active: true,
+                has_transform_track: true,
+                tracks: vec![BoundAnimTrack {
+                    channel: UiAnimChannelDto::AnchoredPosY,
+                    times: vec![0.0, 1.0],
+                    values: vec![0.0, 100.0],
+                }],
+            }],
+        };
+        let mut animator = UiPanelAnimator {
+            frame_entity: frame,
+            clips: vec![
+                clip("footer", footer, [[1.0, 0.0], [0.0, -1.0]]),
+                clip("chat", chat, [[-1.0, 0.0], [0.0, 1.0]]),
+            ],
+            active_clips: Vec::new(),
+            elapsed_secs: 0.0,
+            playing: false,
+            speed: 1.0,
+        };
+        assert!(animator.seek_clips(&["footer", "chat"], 0.5, false));
+        assert!(!animator.play_clips(&["footer", "missing"], false));
+        assert_eq!(
+            animator.active_clips,
+            vec![0, 1],
+            "missing clip must not partially replace playback"
+        );
+        app.world_mut().spawn(animator);
+        app.update();
+        assert_eq!(
+            app.world().get::<UiTransform>(footer).unwrap().translation,
+            Val2::px(0.0, -25.0)
+        );
+        assert_eq!(
+            app.world().get::<UiTransform>(chat).unwrap().translation,
+            Val2::px(0.0, 25.0)
+        );
+    }
+
+    #[test]
+    fn script_slots_preserve_controller_ownership_and_duplicate_object_identity() {
+        let reference = |path_id| UiAssetRefDto {
+            file_index: 7,
+            path_id,
+        };
+        let first = Entity::from_bits(1);
+        let second = Entity::from_bits(2);
+        let mut bound = BoundUiPanel {
+            nodes: HashMap::from([("Image".into(), vec![first, second])]),
+            by_path: HashMap::from([("Content/Image".into(), first)]),
+            by_go_ref: HashMap::from([(reference(10), first), (reference(20), second)]),
+            ..default()
+        };
+        let binding = |owner, component, target, slot| UiScriptBindingDto {
+            script_name: "GameObjectData".into(),
+            field_name: "GameObjects".into(),
+            slot_index: Some(slot),
+            target_name: "Image".into(),
+            target_go_ref: Some(reference(target)),
+            target_path: Some("Content/Image".into()),
+            owner_go_ref: Some(reference(owner)),
+            owner_component_ref: Some(reference(component)),
+            ..default()
+        };
+        let doc = UiPanelDoc {
+            root: UiPanelNodeDto {
+                go_ref: Some(reference(1)),
+                ..default()
+            },
+            script_bindings: vec![
+                binding(2, 200, 20, 0),
+                binding(1, 100, 10, 0),
+                binding(2, 200, 20, 1),
+                binding(1, 100, 30, 1),
+            ],
+            ..default()
+        };
+        bind_panel_scripts(&mut bound, &doc);
+        assert_eq!(bound.game_object_slot(0), Some(first));
+        assert_eq!(
+            bound.controller_slot(reference(200), "GameObjects", 0),
+            Some(second)
+        );
+        assert_eq!(
+            bound.game_object_slot(1),
+            None,
+            "inactive target must not alias the same-named sibling"
+        );
+        assert_eq!(
+            bound.controller_slot(reference(200), "GameObjects", 1),
+            Some(second)
+        );
+    }
+
+    #[test]
+    fn establish_panel_root_slots_match_native_awake() {
+        let doc = load_ui_panel_doc("ui_panels/EstablishPanel.json").unwrap();
+        let mut world = World::new();
+        let mut bound = BoundUiPanel::default();
+        fn register(node: &UiPanelNodeDto, world: &mut World, bound: &mut BoundUiPanel) {
+            let entity = world.spawn_empty().id();
+            bound
+                .nodes
+                .entry(node.name.clone())
+                .or_default()
+                .push(entity);
+            bound
+                .by_go_ref
+                .insert(node.go_ref.expect("exported object identity"), entity);
+            for child in &node.children {
+                register(child, world, bound);
+            }
+        }
+        register(&doc.root, &mut world, &mut bound);
+        bind_panel_scripts(&mut bound, &doc);
+        assert_eq!(bound.game_object_slot(0), bound.first("m_hero_tex"));
+        assert_eq!(bound.game_object_slot(1), bound.first("inp_inputName"));
+        assert_eq!(bound.slots["GameObjects"].len(), 25);
+    }
+
+    #[test]
+    fn native_scroll_rect_keeps_viewport_fixed_and_scrolls_content() {
+        let mut doc = UiPanelDoc {
+            name: "ScrollFixture".into(),
+            reference_width: 1920.0,
+            reference_height: 1080.0,
+            root: UiPanelNodeDto {
+                name: "ScrollFixture".into(),
+                canvas_rect: [0.0, 0.0, 1920.0, 1080.0],
+                children: vec![UiPanelNodeDto {
+                    name: "ScrollRect".into(),
+                    canvas_rect: [300.0, 400.0, 500.0, 100.0],
+                    widget_kind: Some("ScrollRect".into()),
+                    widget_props: Some(UiWidgetPropsDto {
+                        scroll_hv: Some([true, false]),
+                        ..default()
+                    }),
+                    children: vec![UiPanelNodeDto {
+                        name: "Viewport".into(),
+                        canvas_rect: [310.0, 400.0, 480.0, 100.0],
+                        clips_children: true,
+                        children: vec![UiPanelNodeDto {
+                            name: "Content".into(),
+                            canvas_rect: [310.0, 400.0, 960.0, 100.0],
+                            ..default()
+                        }],
+                        ..default()
+                    }],
+                    ..default()
+                }],
+                ..default()
+            },
+            ..default()
+        };
+        fn activate_fixture(node: &mut UiPanelNodeDto) {
+            node.active_self = true;
+            node.scale = default_vec3_one();
+            for child in &mut node.children {
+                activate_fixture(child);
+            }
+        }
+        activate_fixture(&mut doc.root);
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.add_systems(
+            Startup,
+            move |mut commands: Commands, assets: Res<AssetServer>| {
+                commands.spawn(Node::default()).with_children(|root| {
+                    spawn_retained_panel_into(
+                        root,
+                        &doc,
+                        &assets,
+                        None,
+                        &FontSource::sans_serif(),
+                        &UiRetainedOptions::default(),
+                    );
+                });
+            },
+        );
+        app.update();
+        let mut query = app
+            .world_mut()
+            .query::<(&Name, &Node, Option<&UiScrollArea>)>();
+        let nodes = query.iter(app.world()).collect::<Vec<_>>();
+        let (_, container, scroll) = nodes
+            .iter()
+            .find(|(name, _, _)| name.as_str() == "ScrollRect")
+            .unwrap();
+        assert!(
+            scroll.is_none(),
+            "scrolling the outer container would move its viewport"
+        );
+        assert_eq!(container.overflow, Overflow::visible());
+        let (_, viewport, scroll) = nodes
+            .iter()
+            .find(|(name, _, _)| name.as_str() == "Viewport")
+            .unwrap();
+        assert!(scroll.is_some());
+        assert_eq!(viewport.overflow, scroll_overflow([true, false]));
+        assert_eq!(viewport.left, Val::Percent(2.0));
+        assert_eq!(viewport.width, Val::Percent(96.0));
+    }
+
     #[test]
     fn loads_exported_login_and_loading_panel_textures_and_bindings() {
-        let loading = load_ui_panel_doc("ui_panels/LoadingPanel.json")
-            .expect("LoadingPanel.json must parse");
+        let loading =
+            load_ui_panel_doc("ui_panels/LoadingPanel.json").expect("LoadingPanel.json must parse");
         assert!(find_panel_node_texture(&loading, &["m_bg", "RawImage"]).is_some());
         assert_eq!(loading.script_bindings.len(), 8);
         let expected_slots = [
@@ -2057,9 +3083,7 @@ mod tests {
 
         let login =
             load_ui_panel_doc("ui_panels/LoginPanel.json").expect("LoginPanel.json must parse");
-        assert!(
-            find_panel_node_texture(&login, &["RawImage (1)", "m_over_sea_logo"]).is_some()
-        );
+        assert!(find_panel_node_texture(&login, &["RawImage (1)", "m_over_sea_logo"]).is_some());
         let repair = find_panel_node_dto(&login.root, "btn_repair").expect("btn_repair present");
         let announce =
             find_panel_node_dto(&login.root, "btn_announce").expect("btn_announce present");

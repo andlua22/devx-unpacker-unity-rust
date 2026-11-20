@@ -2334,9 +2334,10 @@ pub fn lift_arm64(
                 };
                 insns.push(Insn::new(
                     Op::Convert(conv),
-                    vec![Operand::reg(dst), src],
+                    vec![Operand::reg(dst.clone()), src],
                     addr,
                 ));
+                fp_written.insert(dst);
                 pending_cmp = None;
             }
             A64Opcode::FCVTZS | A64Opcode::FCVTZU => {
@@ -2363,9 +2364,10 @@ pub fn lift_arm64(
                 };
                 insns.push(Insn::new(
                     Op::Convert(conv),
-                    vec![Operand::reg(dst), src],
+                    vec![Operand::reg(dst.clone()), src],
                     addr,
                 ));
+                fp_written.insert(dst);
                 pending_cmp = None;
             }
             A64Opcode::FMAX | A64Opcode::FMIN | A64Opcode::FMAXNM | A64Opcode::FMINNM

@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 bevy = { version = "0.20.1", features = ["wav", "symphonia-wav", "mp3", "vorbis", "system_font_discovery"] }
+bevy-inspector-egui = { version = "0.38.0", default-features = false, features = ["bevy", "documentation"] }
+bevy_egui = { version = "0.43.1", default-features = false, features = ["picking"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

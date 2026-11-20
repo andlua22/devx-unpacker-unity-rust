@@ -8497,6 +8497,92 @@ fn call_arguments_are_placed_by_register_class_not_dump_position() {
     );
 }
 
+/// `CreateCoroutine.MoveNext` @0x209D5DC converts DrawingCfg.needTime in
+/// w20 to s0 before `WaitForSeconds(float)`. A conversion whose FP destination
+/// was absent from the BL dump became MissingAbiArg during alignment, and DCE
+/// then deleted the converted duration. Cover both integer-conversion opcodes
+/// and the corresponding FP-width conversions through lifting and recovery.
+#[test]
+fn arm64_converted_fp_call_arguments_survive_recovery() {
+    for (source, conversion, fp_reg, fp_type, cast) in [
+        (0x52800034, 0x1e220280, "vs0", PrimKind::R4, "float"), // scvtf s0,w20
+        (0x52800034, 0x1e230280, "vs0", PrimKind::R4, "float"), // ucvtf s0,w20
+        (0xd2800034, 0x9e620280, "vd0", PrimKind::R8, "double"), // scvtf d0,x20
+        (0xd2800034, 0x9e630280, "vd0", PrimKind::R8, "double"), // ucvtf d0,x20
+        (0x1e6e1014, 0x1e624280, "vs0", PrimKind::R4, "float"), // fcvt s0,d20
+        (0x1e2e1014, 0x1e22c280, "vd0", PrimKind::R8, "double"), // fcvt d0,s20
+    ] {
+        let bytes = le(&[
+            source,
+            conversion,
+            0x94000040, // bl 0x1108
+            0xd65f03c0, // ret
+        ]);
+        let lifted = lift::lift_arm64(&bytes, 0x1000, 64, None).expect("lift");
+        let mut insns = lifted.insns;
+        let convert = insns
+            .iter()
+            .find(|i| matches!(i.op, Op::Convert(_)))
+            .expect("conversion");
+        assert_eq!(convert.operands[0], Operand::reg(fp_reg), "{convert:?}");
+        let call = insns
+            .iter()
+            .find(|i| matches!(i.op, Op::Call))
+            .expect("call");
+        assert!(
+            call.operands.contains(&Operand::reg(fp_reg)),
+            "converted {fp_reg} must be recorded as a native call argument: {call:?}"
+        );
+        let mut graph = cfg::Cfg::build(&mut insns, &lifted.addresses).expect("cfg");
+        let dom = dominator::DominatorInfo::compute(&graph);
+        let mut ssa_out = ssa::build(&insns, &graph, &dom, &[]);
+        ssa::materialize(&mut ssa_out, &mut graph);
+        let seed = locals::SeedInfo {
+            ret_type: ManagedType::Primitive(PrimKind::Void),
+            is_static: true,
+            ..Default::default()
+        };
+        let mut table = locals::create(&ssa_out.version_slot, &seed);
+        let mut callee = mref("WaitForSeconds", 7, true);
+        callee.sig.ret = ManagedType::Primitive(PrimKind::Void);
+        callee.sig.params = vec![ManagedType::Primitive(fp_type)];
+        assert_eq!(
+            locals::align_call_arguments(
+                &mut ssa_out.insns,
+                &table,
+                |rva| (rva == 0x1108).then(|| callee.clone()),
+                true,
+            ),
+            1
+        );
+        locals::scrub_abi_call_args(&mut ssa_out.insns, &table);
+        locals::propagate_types(&mut ssa_out.insns, &mut table, &locals::NullOracle);
+        passes::trim_call_arguments(&mut ssa_out.insns);
+        passes::dead_code_elimination(&mut ssa_out.insns);
+        ssa::eliminate(&mut ssa_out, &mut graph);
+        let ir = super::RecoveredIr {
+            insns: ssa_out.insns,
+            table,
+            returns_value: false,
+            base_rva: 0x1000,
+        };
+        let out = csharp::render_method_csharp(
+            &ir,
+            "M",
+            true,
+            &[],
+            &ManagedType::Primitive(PrimKind::Void),
+            -1,
+        );
+        assert!(
+            out.contains(&format!("Widget.WaitForSeconds(({cast})")),
+            "converted duration must survive into the recovered call:\n{out}"
+        );
+        assert!(!out.contains("__abi"), "argument became ABI filler:\n{out}");
+        assert!(!out.contains("__unknown"), "conversion lost its source:\n{out}");
+    }
+}
+
 /// `str dN, [x, #imm]` — storing a DOUBLE to memory.
 ///
 /// The store arms read their source through `operand_at`, which names GPRs
@@ -10392,6 +10478,154 @@ fn call_result_read_twice_is_emitted_once() {
         n, 1,
         "one native `bl` must produce exactly one call expression, got {n}:\n{out}"
     );
+}
+
+/// Recovered shape of `MockServer.<CreateCoroutine>d__85.MoveNext`
+/// @0x209D528: the ARM64 call writes x0 even when its managed return type is
+/// void, and phi elimination copies that ABI slot before a null-check edge.
+/// The edge destination is read at a shared branch target, so the renderer
+/// must normally materialize its copies. The enclosing method returns bool.
+fn call_result_null_edge_ir(ret: ManagedType, copy_count: u32) -> super::RecoveredIr {
+    assert!(copy_count > 0);
+    let mut callee = mref("AddItemToBag", 7, true);
+    callee.sig.ret = ret.clone();
+    callee.sig.params = vec![
+        ManagedType::Primitive(PrimKind::I4),
+        ManagedType::Primitive(PrimKind::I4),
+    ];
+    let mut call = Insn::new(
+        Op::Call,
+        vec![
+            Operand::Method(callee),
+            Operand::Local(2),
+            Operand::imm(55101),
+            Operand::imm(1),
+        ],
+        0x209d528,
+    );
+    call.dest_type = Some(ret);
+    let join = 7 + copy_count as usize;
+    let mut insns = vec![
+        Insn::new(
+            Op::Compare(CompareKind::Equal),
+            vec![Operand::Local(10), Operand::Local(1), Operand::imm(0)],
+            0x209d518,
+        ),
+        Insn::move_(Operand::Local(4), Operand::Local(1), 0x209d518),
+        Insn::new(Op::CondJump(join), vec![Operand::Local(10)], 0x209d518),
+        call,
+        Insn::new(
+            Op::Compare(CompareKind::Equal),
+            vec![Operand::Local(11), Operand::Local(3), Operand::imm(0)],
+            0x209d530,
+        ),
+    ];
+    let mut src = 2;
+    for n in 0..copy_count {
+        let dst = if n + 1 == copy_count { 4 } else { 20 + n };
+        insns.push(Insn::move_(
+            Operand::Local(dst),
+            Operand::Local(src),
+            0x209d530,
+        ));
+        src = dst;
+    }
+    insns.extend([
+        Insn::new(Op::CondJump(join), vec![Operand::Local(11)], 0x209d530),
+        Insn::new(Op::Return, vec![Operand::imm(1)], 0x209d534),
+        // The null-check failure path reads the merged ABI slot. A memory
+        // store makes that use observable without another managed call.
+        Insn::move_(
+            Operand::Memory {
+                base: Box::new(Operand::Local(4)),
+                index: None,
+                scale: 1,
+                addend: 0,
+                width: 8,
+            },
+            Operand::imm(7),
+            0x209d600,
+        ),
+        Insn::new(Op::Return, vec![Operand::imm(0)], 0x209d604),
+    ]);
+    super::RecoveredIr {
+        insns,
+        table: plain_local_table(&(1..=24).collect::<Vec<_>>()),
+        returns_value: true,
+        base_rva: 0x209d518,
+    }
+}
+
+#[test]
+fn void_call_result_edge_copies_in_bool_method_do_not_repeat_the_call() {
+    for copies in [1, 3] {
+        let ir = call_result_null_edge_ir(ManagedType::Primitive(PrimKind::Void), copies);
+        let out = csharp::render_method_csharp(
+            &ir,
+            "MoveNext",
+            true,
+            &[],
+            &ManagedType::Primitive(PrimKind::Boolean),
+            -1,
+        );
+        assert_eq!(
+            out.matches("AddItemToBag(").count(),
+            1,
+            "one native void call followed by {copies} ABI copies must emit once:\n{out}"
+        );
+        assert!(out.contains("55101, 1"), "product arguments lost:\n{out}");
+        assert!(out.contains("return true;"), "success path lost:\n{out}");
+        assert!(out.contains("return false;"), "failure path lost:\n{out}");
+        assert!(out.contains("= 7;"), "shared branch body lost:\n{out}");
+    }
+}
+
+#[test]
+fn value_call_result_edge_copies_keep_the_value() {
+    for ret in [ManagedType::Unknown, ManagedType::Primitive(PrimKind::I4)] {
+        let ir = call_result_null_edge_ir(ret, 3);
+        let out = csharp::render_method_csharp(
+            &ir,
+            "MoveNext",
+            true,
+            &[],
+            &ManagedType::Primitive(PrimKind::Boolean),
+            -1,
+        );
+        assert_eq!(out.matches("AddItemToBag(").count(), 1, "{out}");
+        assert!(
+            out.contains("addItemToBag = Widget.AddItemToBag(55101, 1);"),
+            "unknown/nonvoid result must be bound:\n{out}"
+        );
+        assert!(
+            out.contains("*(nint*)(addItemToBag) = 7;"),
+            "edge value lost:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn distinct_void_call_sites_are_preserved() {
+    let mut ir = call_result_null_edge_ir(ManagedType::Primitive(PrimKind::Void), 1);
+    // Identical text at a separate native address still means a second call.
+    let mut second = ir.insns[3].clone();
+    second.address = 0x209d5f0;
+    second.operands[1] = Operand::Local(5);
+    ir.insns.insert(3, second);
+    for insn in &mut ir.insns {
+        if let Op::CondJump(target) = &mut insn.op {
+            *target += 1;
+        }
+    }
+    let out = csharp::render_method_csharp(
+        &ir,
+        "MoveNext",
+        true,
+        &[],
+        &ManagedType::Primitive(PrimKind::Boolean),
+        -1,
+    );
+    assert_eq!(out.matches("AddItemToBag(").count(), 2, "{out}");
 }
 
 /// A conditional jump whose taken target is the statement that executes next

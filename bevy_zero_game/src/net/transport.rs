@@ -1,7 +1,7 @@
 //! Pure `std::net::UdpSocket` authoritative server (up to 100 players) and client transport
 //! running on Bevy `FixedUpdate`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -9,6 +9,9 @@ use bevy::app::ScheduleRunnerPlugin;
 use bevy::prelude::*;
 
 use crate::config::ServerEntry;
+use crate::crafting::{
+    CraftCatalog, CraftContext, CraftMode, CraftQueue, CraftRequest, ItemAmount, ItemInventory,
+};
 use crate::world_physics::{
     BuildPieceKind, EnemyKind, LootDropKind, ReplicatedEnemy, ReplicatedLootDrop,
     ReplicatedResourceNode, ReplicatedStructure, ResourceNodeKind, TerrainColliderGrid,
@@ -18,13 +21,36 @@ use crate::world_physics::{
 
 use super::interest::{InterestGrid, SpatialPeer};
 use super::protocol::{
-    MAX_PLAYERS, MAX_SNAPSHOT_PEERS, NetEnemyDto, NetLootDropDto, NetPlayerState,
-    PacketEnvelope, PacketKind, TICK_HZ, decode_packet, encode_packet,
+    MAX_PLAYERS, MAX_SNAPSHOT_PEERS, NetEnemyDto, NetLootDropDto, NetPlayerState, PacketEnvelope,
+    PacketKind, TICK_HZ, decode_packet, encode_packet,
 };
 
 const PLAYER_MOVE_SPEED: f32 = 5.5;
 const PLAYER_SPRINT_SPEED: f32 = 8.4;
 const ARENA_HALF_EXTENT: f32 = 560.0;
+
+const WOOD_ITEM_ID: i32 = 50001;
+const CLOTH_ITEM_ID: i32 = 50003;
+const STONE_ITEM_ID: i32 = 50006;
+const IRON_ITEM_ID: i32 = 50008;
+const RIFLE_AMMO_ITEM_ID: i32 = 53202;
+const BANDAGE_ITEM_ID: i32 = 55101;
+
+fn initial_inventory(catalog: &CraftCatalog) -> ItemInventory {
+    // Retain existing local-host starter quantities; original spawn inventory remains unknown.
+    ItemInventory::from_counts(
+        catalog,
+        [
+            (WOOD_ITEM_ID, 120),
+            (STONE_ITEM_ID, 60),
+            (IRON_ITEM_ID, 25),
+            (CLOTH_ITEM_ID, 30),
+            (RIFLE_AMMO_ITEM_ID, 60),
+            (BANDAGE_ITEM_ID, 2),
+        ],
+    )
+    .expect("starter inventory uses installed native ItemCfg IDs")
+}
 
 /// Server-owned authoritative state for one connected player or virtual stress-test peer.
 #[derive(Debug, Clone)]
@@ -42,14 +68,55 @@ pub struct ServerPlayer {
     pub sprint: bool,
     pub anim_state: u8,
     pub hp: u16,
-    pub wood: u32,
-    pub stone: u32,
-    pub iron: u32,
-    pub fiber: u32,
-    pub ammo: u16,
-    pub bandages: u16,
+    pub inventory: ItemInventory,
+    pub craft_queue: CraftQueue,
+    pub craft_context: CraftContext,
+    craft_requests: HashMap<u32, (CraftRequest, i64, bool, String)>,
+    newest_craft_request: Option<u32>,
     pub is_bot: bool,
     pub last_heard_tick: u32,
+}
+
+impl ServerPlayer {
+    fn wood(&self) -> u32 {
+        self.inventory.amount(WOOD_ITEM_ID) as u32
+    }
+    fn stone(&self) -> u32 {
+        self.inventory.amount(STONE_ITEM_ID) as u32
+    }
+    fn iron(&self) -> u32 {
+        self.inventory.amount(IRON_ITEM_ID) as u32
+    }
+    fn fiber(&self) -> u32 {
+        self.inventory.amount(CLOTH_ITEM_ID) as u32
+    }
+    fn ammo(&self) -> u16 {
+        self.inventory
+            .amount(RIFLE_AMMO_ITEM_ID)
+            .min(i32::from(u16::MAX)) as u16
+    }
+    fn bandages(&self) -> u16 {
+        self.inventory
+            .amount(BANDAGE_ITEM_ID)
+            .min(i32::from(u16::MAX)) as u16
+    }
+
+    fn grant(&mut self, catalog: &CraftCatalog, items: &[(i32, i32)]) {
+        let amounts: Vec<_> = items
+            .iter()
+            .map(|&(item_id, num)| ItemAmount { item_id, num })
+            .collect();
+        let _ = self.inventory.add_atomic(catalog, &amounts);
+    }
+
+    fn spend(&mut self, items: &[(i32, i32)]) -> bool {
+        let amounts: Vec<_> = items
+            .iter()
+            .filter(|(_, num)| *num > 0)
+            .map(|&(item_id, num)| ItemAmount { item_id, num })
+            .collect();
+        self.inventory.consume_atomic(&amounts).is_ok()
+    }
 }
 
 /// Authoritative server simulation enforcing [`MAX_PLAYERS`] and per-observer [`InterestGrid`]
@@ -59,6 +126,12 @@ pub struct ServerWorld {
     pub tick: u32,
     next_player_id: u16,
     pub(super) players: HashMap<u16, ServerPlayer>,
+    pub craft_catalog: CraftCatalog,
+    pub storage_server_id: u32,
+    battle_craft_mode: CraftMode,
+    battle_mode: i32,
+    saved_production: HashMap<String, (ItemInventory, CraftQueue)>,
+    detached_building_owners: HashMap<u32, String>,
     addr_to_id: HashMap<SocketAddr, u16>,
     grid: InterestGrid,
     pub terrain: TerrainColliderGrid,
@@ -79,6 +152,9 @@ pub struct ServerWorld {
 
 impl ServerWorld {
     pub fn new(server_name: impl Into<String>) -> Self {
+        let craft_catalog = CraftCatalog::load_default().expect(
+            "native ItemCfg and DrawingCfg must be installed before starting the game server",
+        );
         let terrain = TerrainColliderGrid::load_default();
         let nodes = generate_default_resource_nodes(&terrain);
         let enemies = generate_default_enemies(&terrain);
@@ -89,6 +165,12 @@ impl ServerWorld {
             tick: 0,
             next_player_id: 1,
             players: HashMap::with_capacity(MAX_PLAYERS),
+            craft_catalog,
+            storage_server_id: 0,
+            battle_craft_mode: CraftMode::Island,
+            battle_mode: 0,
+            saved_production: HashMap::new(),
+            detached_building_owners: HashMap::new(),
             addr_to_id: HashMap::with_capacity(MAX_PLAYERS),
             grid: InterestGrid::default(),
             terrain,
@@ -126,7 +208,9 @@ impl ServerWorld {
     ) -> Result<u16, &'static str> {
         if let Some(&existing_id) = self.addr_to_id.get(&addr) {
             if let Some(p) = self.players.get_mut(&existing_id) {
-                p.account_name = account_name;
+                if p.account_name != account_name {
+                    return Err("account_changed_reconnect");
+                }
                 p.last_heard_tick = self.tick;
             }
             return Ok(existing_id);
@@ -153,6 +237,21 @@ impl ServerWorld {
         let sz = ring_angle.sin() * spawn_r;
         let sy = self.terrain.ground_y(sx, sz);
 
+        let (inventory, craft_queue) =
+            self.saved_production
+                .remove(&account_name)
+                .unwrap_or_else(|| {
+                    (
+                        initial_inventory(&self.craft_catalog),
+                        CraftQueue::default(),
+                    )
+                });
+        for structure in &mut self.structures {
+            if self.detached_building_owners.get(&structure.id) == Some(&account_name) {
+                structure.owner_id = player_id;
+                self.detached_building_owners.remove(&structure.id);
+            }
+        }
         self.players.insert(
             player_id,
             ServerPlayer {
@@ -169,18 +268,31 @@ impl ServerWorld {
                 sprint: false,
                 anim_state: 0,
                 hp: 100,
-                wood: 120,
-                stone: 60,
-                iron: 25,
-                fiber: 30,
-                ammo: 60,
-                bandages: 2,
+                inventory,
+                craft_queue,
+                craft_context: CraftContext {
+                    mode: self.battle_craft_mode,
+                    battle_mode: self.battle_mode,
+                    queue_limit: 5,
+                    ..Default::default()
+                },
+                craft_requests: HashMap::new(),
+                newest_craft_request: None,
                 is_bot: false,
                 last_heard_tick: self.tick,
             },
         );
         self.addr_to_id.insert(addr, player_id);
         Ok(player_id)
+    }
+
+    pub fn configure_battle(&mut self, mode: CraftMode, battle_mode: i32) {
+        self.battle_craft_mode = mode;
+        self.battle_mode = battle_mode;
+        for player in self.players.values_mut() {
+            player.craft_context.mode = mode;
+            player.craft_context.battle_mode = battle_mode;
+        }
     }
 
     fn allocate_player_id(&mut self) -> Option<u16> {
@@ -195,9 +307,116 @@ impl ServerWorld {
     }
 
     pub fn remove_addr(&mut self, addr: &SocketAddr) {
-        if let Some(id) = self.addr_to_id.remove(addr) {
-            self.players.remove(&id);
+        if let Some(id) = self.addr_to_id.remove(addr)
+            && let Some(player) = self.players.remove(&id)
+        {
+            for structure in self
+                .structures
+                .iter_mut()
+                .filter(|structure| structure.owner_id == id)
+            {
+                self.detached_building_owners
+                    .insert(structure.id, player.account_name.clone());
+                structure.owner_id = 0;
+            }
+            self.saved_production
+                .insert(player.account_name, (player.inventory, player.craft_queue));
+            self.world_rev = self.world_rev.wrapping_add(1);
         }
+    }
+
+    /// Applies an idempotent production request. Retries return the original result.
+    pub fn apply_craft_request(
+        &mut self,
+        addr: &SocketAddr,
+        request_id: u32,
+        drawing_id: i32,
+        create_num: i32,
+        near_building_instance_id: i64,
+    ) -> PacketKind {
+        let result = |accepted, reason| PacketKind::CraftResult {
+            request_id,
+            accepted,
+            reason,
+        };
+        let Some(player) = self
+            .addr_to_id
+            .get(addr)
+            .and_then(|id| self.players.get_mut(id))
+        else {
+            return result(false, "Connect before requesting production".to_owned());
+        };
+        let request = CraftRequest {
+            drawing_id,
+            create_num,
+        };
+        if let Some((original, facility, accepted, reason)) = player.craft_requests.get(&request_id)
+        {
+            if original != &request || *facility != near_building_instance_id {
+                return result(
+                    false,
+                    "Request identifier already belongs to another recipe".to_owned(),
+                );
+            }
+            return result(*accepted, reason.clone());
+        }
+        if let Some(newest) = player.newest_craft_request
+            && !super::inventory::revision_is_newer(request_id, newest)
+            && newest.wrapping_sub(request_id) >= 128
+        {
+            return result(false, "Expired production request".to_owned());
+        }
+        if player
+            .newest_craft_request
+            .is_none_or(|newest| super::inventory::revision_is_newer(request_id, newest))
+        {
+            player.newest_craft_request = Some(request_id);
+        }
+        let newest = player.newest_craft_request.unwrap();
+        player
+            .craft_requests
+            .retain(|id, _| newest.wrapping_sub(*id) < 128);
+        let mut context = player.craft_context.clone();
+        // BuildManager.AimDis is initialized to 4.5 in the native controller.
+        context.workbenches = self
+            .structures
+            .iter()
+            .filter(|structure| {
+                structure.kind == BuildPieceKind::Workbench
+                    && structure.hp > 0
+                    && structure.pos.distance_squared(player.pos) <= 4.5 * 4.5
+            })
+            .map(|structure| crate::crafting::WorkbenchAccess {
+                facility_id: i64::from(structure.id),
+                kind: 1,
+                level: i32::from(structure.tier),
+            })
+            .collect();
+        // Only facilities established by the authoritative world can satisfy a requirement.
+        if near_building_instance_id != -1 {
+            context
+                .workbenches
+                .retain(|facility| facility.facility_id == near_building_instance_id);
+        }
+        let outcome = player.craft_queue.enqueue(
+            &self.craft_catalog,
+            &mut player.inventory,
+            request,
+            &context,
+        );
+        let accepted = outcome.is_ok();
+        let reason = match outcome {
+            Ok(()) => {
+                self.world_rev = self.world_rev.wrapping_add(1);
+                "Production queued".to_owned()
+            }
+            Err(error) => error.to_string(),
+        };
+        player.craft_requests.insert(
+            request_id,
+            (request, near_building_instance_id, accepted, reason.clone()),
+        );
+        result(accepted, reason)
     }
 
     /// Fills remaining server slots up to [`MAX_PLAYERS`] with deterministic moving bots to stress-test
@@ -233,12 +452,14 @@ impl ServerWorld {
                     sprint: false,
                     anim_state: 1,
                     hp: 100,
-                    wood: 0,
-                    stone: 0,
-                    iron: 0,
-                    fiber: 0,
-                    ammo: 0,
-                    bandages: 0,
+                    inventory: ItemInventory::default(),
+                    craft_queue: CraftQueue::default(),
+                    craft_context: CraftContext {
+                        queue_limit: 5,
+                        ..Default::default()
+                    },
+                    craft_requests: HashMap::new(),
+                    newest_craft_request: None,
                     is_bot: true,
                     last_heard_tick: self.tick,
                 },
@@ -311,17 +532,17 @@ impl ServerWorld {
                     let node_pos = node.pos;
                     match node_kind {
                         ResourceNodeKind::PineTree | ResourceNodeKind::PalmTree => {
-                            p.wood = p.wood.saturating_add(16);
-                            p.fiber = p.fiber.saturating_add(6);
+                            p.grant(&self.craft_catalog, &[(WOOD_ITEM_ID, 16)]);
+                            p.grant(&self.craft_catalog, &[(CLOTH_ITEM_ID, 6)]);
                         }
                         ResourceNodeKind::OreBoulder => {
-                            p.stone = p.stone.saturating_add(14);
-                            p.iron = p.iron.saturating_add(6);
+                            p.grant(&self.craft_catalog, &[(STONE_ITEM_ID, 14)]);
+                            p.grant(&self.craft_catalog, &[(IRON_ITEM_ID, 6)]);
                         }
                         ResourceNodeKind::SupplyCrate => {
-                            p.ammo = p.ammo.saturating_add(12);
-                            p.bandages = p.bandages.saturating_add(1);
-                            p.wood = p.wood.saturating_add(8);
+                            p.grant(&self.craft_catalog, &[(RIFLE_AMMO_ITEM_ID, 12)]);
+                            p.grant(&self.craft_catalog, &[(BANDAGE_ITEM_ID, 1)]);
+                            p.grant(&self.craft_catalog, &[(WOOD_ITEM_ID, 8)]);
                         }
                     }
                     if node.hp == 0 && node_kind == ResourceNodeKind::SupplyCrate {
@@ -342,9 +563,9 @@ impl ServerWorld {
                         let rz = angle.sin() * 28.0;
                         victim.pos = Vec3::new(rx, self.terrain.ground_y(rx, rz), rz);
                         if let Some(attacker) = self.players.get_mut(&pid) {
-                            attacker.wood = attacker.wood.saturating_add(25);
-                            attacker.stone = attacker.stone.saturating_add(15);
-                            attacker.ammo = attacker.ammo.saturating_add(10);
+                            attacker.grant(&self.craft_catalog, &[(WOOD_ITEM_ID, 25)]);
+                            attacker.grant(&self.craft_catalog, &[(STONE_ITEM_ID, 15)]);
+                            attacker.grant(&self.craft_catalog, &[(RIFLE_AMMO_ITEM_ID, 10)]);
                         }
                     }
                     self.world_rev = self.world_rev.wrapping_add(1);
@@ -353,7 +574,7 @@ impl ServerWorld {
             super::protocol::OP_PLACE_BUILD => {
                 let kind = BuildPieceKind::from_u8(param_a);
                 let cost = kind.wood_cost();
-                if p.wood < cost {
+                if p.wood() < cost {
                     return;
                 }
                 let p_pos = Vec3::new(
@@ -369,7 +590,9 @@ impl ServerWorld {
                 if duplicate {
                     return;
                 }
-                p.wood -= cost;
+                if !p.spend(&[(WOOD_ITEM_ID, cost as i32)]) {
+                    return;
+                }
                 let max_hp = kind.max_hp_for_tier(1);
                 let id = self.next_build_id;
                 self.next_build_id = self.next_build_id.wrapping_add(1);
@@ -404,11 +627,15 @@ impl ServerWorld {
                 } else {
                     0
                 };
-                if p.stone < stone_cost || p.iron < iron_cost {
+                if p.stone() < stone_cost || p.iron() < iron_cost {
                     return;
                 }
-                p.stone -= stone_cost;
-                p.iron -= iron_cost;
+                if !p.spend(&[
+                    (STONE_ITEM_ID, stone_cost as i32),
+                    (IRON_ITEM_ID, iron_cost as i32),
+                ]) {
+                    return;
+                }
                 st.tier += 1;
                 st.max_hp = st.kind.max_hp_for_tier(st.tier);
                 st.hp = st.max_hp;
@@ -424,82 +651,26 @@ impl ServerWorld {
                     self.world_rev = self.world_rev.wrapping_add(1);
                 }
             }
-            super::protocol::OP_CRAFT_RECIPE => {
-                match param_a {
-                    0 if p.wood >= 10 && p.stone >= 5 => {
-                        p.wood -= 10;
-                        p.stone -= 5;
-                        p.ammo = p.ammo.saturating_add(15);
-                    }
-                    1 if p.fiber >= 10 => {
-                        p.fiber -= 10;
-                        p.bandages = p.bandages.saturating_add(1);
-                    }
-                    2 if p.wood >= 15 => {
-                        p.wood -= 15;
-                        p.stone = p.stone.saturating_add(20);
-                    }
-                    3 if p.stone >= 20 => {
-                        p.stone -= 20;
-                        p.iron = p.iron.saturating_add(12);
-                    }
-                    4 if p.iron >= 15 && p.wood >= 10 => {
-                        p.iron -= 15;
-                        p.wood -= 10;
-                        p.ammo = p.ammo.saturating_add(30);
-                    }
-                    5 if p.wood >= 15 && p.iron >= 10 && p.fiber >= 10 => {
-                        p.wood -= 15;
-                        p.iron -= 10;
-                        p.fiber -= 10;
-                        let p_pos = p.pos;
-                        if let Some(gen_id) = self
-                            .structures
-                            .iter()
-                            .filter(|s| s.kind == BuildPieceKind::Generator && s.hp > 0)
-                            .min_by(|a, b| {
-                                a.pos
-                                    .distance_squared(p_pos)
-                                    .total_cmp(&b.pos.distance_squared(p_pos))
-                            })
-                            .map(|s| s.id)
-                        {
-                            let fuel = self.generator_fuels.entry(gen_id).or_insert(500.0);
-                            *fuel = (*fuel + 350.0).min(1000.0);
-                            self.generator_active.insert(gen_id, true);
-                        }
-                    }
-                    6 if p.wood >= 20 && p.iron >= 15 => {
-                        p.wood -= 20;
-                        p.iron -= 15;
-                        let p_pos = p.pos;
-                        if let Some(v) = self
-                            .vehicles
-                            .iter_mut()
-                            .filter(|v| v.driver_id == pid || v.pos.distance_squared(p_pos) <= 100.0)
-                            .min_by(|a, b| {
-                                a.pos
-                                    .distance_squared(p_pos)
-                                    .total_cmp(&b.pos.distance_squared(p_pos))
-                            })
-                        {
-                            v.hp = v.hp.saturating_add(220).min(v.max_hp);
-                            v.fuel = (v.fuel + 200.0).min(v.max_fuel);
-                        }
-                    }
-                    _ => {}
-                }
-                self.world_rev = self.world_rev.wrapping_add(1);
-            }
+            // Native production uses the signed 32-bit CraftRequest message.
+            super::protocol::OP_CRAFT_RECIPE => (),
             super::protocol::OP_CONSUME_BANDAGE => {
-                if p.bandages > 0 && p.hp < 100 {
-                    p.bandages -= 1;
-                    p.hp = p.hp.saturating_add(35).min(100);
+                let healing = self
+                    .craft_catalog
+                    .item(BANDAGE_ITEM_ID)
+                    .and_then(|item| item.extras.first())
+                    .copied()
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .unwrap_or(0.0) as u16;
+                if p.bandages() > 0 && p.hp < 100 {
+                    if !p.spend(&[(BANDAGE_ITEM_ID, 1)]) {
+                        return;
+                    }
+                    p.hp = p.hp.saturating_add(healing).min(100);
                     self.world_rev = self.world_rev.wrapping_add(1);
                 }
             }
             super::protocol::OP_SPEND_AMMO => {
-                p.ammo = p.ammo.saturating_sub(1);
+                p.spend(&[(RIFLE_AMMO_ITEM_ID, 1)]);
                 self.world_rev = self.world_rev.wrapping_add(1);
             }
             super::protocol::OP_HIT_ENEMY => {
@@ -507,9 +678,13 @@ impl ServerWorld {
                 let dmg = u16::from(param_b.clamp(5, 85));
                 if let Some((killed_kind, drop_pos)) = self.damage_enemy(enemy_id, dmg) {
                     if let Some(attacker) = self.players.get_mut(&pid) {
-                        let mult = if killed_kind == EnemyKind::PortBossMech { 4 } else { 1 };
-                        attacker.wood = attacker.wood.saturating_add(15 * mult);
-                        attacker.iron = attacker.iron.saturating_add(8 * mult);
+                        let mult = if killed_kind == EnemyKind::PortBossMech {
+                            4
+                        } else {
+                            1
+                        };
+                        attacker.grant(&self.craft_catalog, &[(WOOD_ITEM_ID, 15 * mult)]);
+                        attacker.grant(&self.craft_catalog, &[(IRON_ITEM_ID, 8 * mult)]);
                     }
                     let drop_kind = if killed_kind == EnemyKind::PortBossMech {
                         LootDropKind::SeniorCrate
@@ -528,11 +703,26 @@ impl ServerWorld {
                 {
                     let drop = self.loot_drops.swap_remove(idx);
                     if let Some(picker) = self.players.get_mut(&pid) {
-                        picker.ammo = picker.ammo.saturating_add(drop.ammo_bonus);
-                        picker.wood = picker.wood.saturating_add(u32::from(drop.wood_bonus));
-                        picker.stone = picker.stone.saturating_add(u32::from(drop.stone_bonus));
-                        picker.iron = picker.iron.saturating_add(u32::from(drop.iron_bonus));
-                        picker.bandages = picker.bandages.saturating_add(u16::from(drop.bandage_bonus));
+                        picker.grant(
+                            &self.craft_catalog,
+                            &[(RIFLE_AMMO_ITEM_ID, (drop.ammo_bonus) as i32)],
+                        );
+                        picker.grant(
+                            &self.craft_catalog,
+                            &[(WOOD_ITEM_ID, (u32::from(drop.wood_bonus)) as i32)],
+                        );
+                        picker.grant(
+                            &self.craft_catalog,
+                            &[(STONE_ITEM_ID, (u32::from(drop.stone_bonus)) as i32)],
+                        );
+                        picker.grant(
+                            &self.craft_catalog,
+                            &[(IRON_ITEM_ID, (u32::from(drop.iron_bonus)) as i32)],
+                        );
+                        picker.grant(
+                            &self.craft_catalog,
+                            &[(BANDAGE_ITEM_ID, i32::from(drop.bandage_bonus))],
+                        );
                     }
                     self.world_rev = self.world_rev.wrapping_add(1);
                 }
@@ -583,8 +773,7 @@ impl ServerWorld {
                         });
                     if let Some(vi) = pick_idx {
                         self.vehicles[vi].driver_id = pid;
-                        let seat_pos =
-                            self.vehicles[vi].pos + self.vehicles[vi].kind.seat_offset();
+                        let seat_pos = self.vehicles[vi].pos + self.vehicles[vi].kind.seat_offset();
                         let seat_yaw = self.vehicles[vi].yaw;
                         if let Some(driver) = self.players.get_mut(&pid) {
                             driver.pos = seat_pos;
@@ -620,9 +809,10 @@ impl ServerWorld {
                 if let Some(gid) = gen_id {
                     let cur_fuel = *self.generator_fuels.get(&gid).unwrap_or(&0.0);
                     let cur_active = *self.generator_active.get(&gid).unwrap_or(&true);
-                    if cur_fuel < 400.0 && p.wood >= 15 && p.iron >= 10 {
-                        p.wood -= 15;
-                        p.iron -= 10;
+                    if cur_fuel < 400.0 && p.wood() >= 15 && p.iron() >= 10 {
+                        if !p.spend(&[(WOOD_ITEM_ID, 15), (IRON_ITEM_ID, 10)]) {
+                            return;
+                        }
                         let f = self.generator_fuels.entry(gid).or_insert(0.0);
                         *f = (*f + 350.0).min(1000.0);
                         self.generator_active.insert(gid, true);
@@ -634,8 +824,8 @@ impl ServerWorld {
             }
             super::protocol::OP_REPAIR_VEHICLE => {
                 let p_pos = p.pos;
-                if p.wood >= 15
-                    && p.iron >= 10
+                if p.wood() >= 15
+                    && p.iron() >= 10
                     && let Some(v) = self
                         .vehicles
                         .iter_mut()
@@ -652,9 +842,10 @@ impl ServerWorld {
                 {
                     v.hp = v.hp.saturating_add(180).min(v.max_hp);
                     v.fuel = (v.fuel + 150.0).min(v.max_fuel);
-                    if let Some(p_mut) = self.players.get_mut(&pid) {
-                        p_mut.wood -= 15;
-                        p_mut.iron -= 10;
+                    if let Some(p_mut) = self.players.get_mut(&pid)
+                        && !p_mut.spend(&[(WOOD_ITEM_ID, 15), (IRON_ITEM_ID, 10)])
+                    {
+                        return;
                     }
                     self.world_rev = self.world_rev.wrapping_add(1);
                 }
@@ -689,7 +880,10 @@ impl ServerWorld {
     }
 
     fn damage_enemy(&mut self, enemy_id: u16, dmg: u16) -> Option<(EnemyKind, Vec3)> {
-        let enemy = self.enemies.iter_mut().find(|e| e.id == enemy_id && e.hp > 0)?;
+        let enemy = self
+            .enemies
+            .iter_mut()
+            .find(|e| e.id == enemy_id && e.hp > 0)?;
         enemy.hp = enemy.hp.saturating_sub(dmg);
         if enemy.hp == 0 {
             enemy.is_moving = false;
@@ -747,8 +941,10 @@ impl ServerWorld {
                 if dist > atk_r * 0.82 {
                     let dir = to_p.normalize_or_zero();
                     let spd = enemy.kind.move_speed();
-                    enemy.pos.x = (enemy.pos.x + dir.x * spd * dt).clamp(-ARENA_HALF_EXTENT, ARENA_HALF_EXTENT);
-                    enemy.pos.z = (enemy.pos.z + dir.y * spd * dt).clamp(-ARENA_HALF_EXTENT, ARENA_HALF_EXTENT);
+                    enemy.pos.x = (enemy.pos.x + dir.x * spd * dt)
+                        .clamp(-ARENA_HALF_EXTENT, ARENA_HALF_EXTENT);
+                    enemy.pos.z = (enemy.pos.z + dir.y * spd * dt)
+                        .clamp(-ARENA_HALF_EXTENT, ARENA_HALF_EXTENT);
                     enemy.pos.y = self.terrain.ground_y(enemy.pos.x, enemy.pos.z);
                     enemy.is_moving = true;
                 } else {
@@ -838,7 +1034,9 @@ impl ServerWorld {
         }
 
         let new_pct = if active_gens > 0 {
-            ((fuel_sum / active_gens as f32) * 100.0).round().clamp(1.0, 100.0) as u8
+            ((fuel_sum / active_gens as f32) * 100.0)
+                .round()
+                .clamp(1.0, 100.0) as u8
         } else {
             0
         };
@@ -860,7 +1058,10 @@ impl ServerWorld {
         let mut drops_to_spawn: Vec<(LootDropKind, Vec3, u16, u16)> = Vec::new();
         for idx in 0..self.structures.len() {
             let kind = self.structures[idx].kind;
-            if !matches!(kind, BuildPieceKind::Turret | BuildPieceKind::ElectricTurret) {
+            if !matches!(
+                kind,
+                BuildPieceKind::Turret | BuildPieceKind::ElectricTurret
+            ) {
                 continue;
             }
             let sid = self.structures[idx].id;
@@ -922,7 +1123,10 @@ impl ServerWorld {
         for (dk, dpos, owner_id, bonus) in drops_to_spawn {
             self.spawn_loot_drop(dk, dpos);
             if let Some(owner) = self.players.get_mut(&owner_id) {
-                owner.wood = owner.wood.saturating_add(u32::from(bonus));
+                owner.grant(
+                    &self.craft_catalog,
+                    &[(WOOD_ITEM_ID, (u32::from(bonus)) as i32)],
+                );
             }
         }
     }
@@ -998,7 +1202,7 @@ impl ServerWorld {
         for (dk, dpos, driver_id) in killed_drops {
             self.spawn_loot_drop(dk, dpos);
             if let Some(p) = self.players.get_mut(&driver_id) {
-                p.wood = p.wood.saturating_add(15);
+                p.grant(&self.craft_catalog, &[(WOOD_ITEM_ID, 15)]);
             }
         }
     }
@@ -1016,7 +1220,7 @@ impl ServerWorld {
         let structures = self
             .structures
             .iter()
-            .filter(|s| s.hp > 0)
+            .filter(|s| s.hp > 0 && s.owner_id == owner_id)
             .map(|s| crate::config::SavedStructureEntry {
                 kind: s.kind as u8,
                 tier: s.tier,
@@ -1036,39 +1240,123 @@ impl ServerWorld {
             })
             .collect();
         crate::config::BaseSaveData {
-            version: 1,
-            wood: p.map_or(180, |x| x.wood),
-            stone: p.map_or(90, |x| x.stone),
-            iron: p.map_or(45, |x| x.iron),
-            fiber: p.map_or(40, |x| x.fiber),
-            ammo: p.map_or(60, |x| u32::from(x.ammo)),
-            bandages: p.map_or(2, |x| x.bandages.min(255) as u8),
+            version: 2,
+            wood: p.map_or(180, |x| x.wood()),
+            stone: p.map_or(90, |x| x.stone()),
+            iron: p.map_or(45, |x| x.iron()),
+            fiber: p.map_or(40, |x| x.fiber()),
+            ammo: p.map_or(60, |x| u32::from(x.ammo())),
+            bandages: p.map_or(2, |x| x.bandages().min(255) as u8),
             generator_fuel: gen_fuel,
             structures,
+            owner_key: p.map(|player| crate::config::LocalRoleKey {
+                account_name: player.account_name.clone(),
+                server_id: self.storage_server_id,
+            }),
+            inventory: p.map(|player| player.inventory.clone()),
+            craft_queue: p.map_or_else(CraftQueue::default, |player| player.craft_queue.clone()),
         }
     }
 
+    pub fn saved_base_path(&self, owner_id: u16) -> std::path::PathBuf {
+        crate::config::BaseSaveData::resolve_role_save_path(
+            self.players
+                .get(&owner_id)
+                .map_or("", |player| player.account_name.as_str()),
+            self.storage_server_id,
+        )
+    }
+
     /// Restores persisted base structures and generator fuels into authoritative `ServerWorld`.
-    pub fn import_saved_base(&mut self, save: &crate::config::BaseSaveData) {
-        self.structures.clear();
-        self.generator_fuels.clear();
-        self.generator_active.clear();
-        self.next_build_id = 1;
+    pub fn import_saved_base(&mut self, save: &crate::config::BaseSaveData) -> Result<(), String> {
+        if !(1..=2).contains(&save.version) {
+            return Err("Unsupported base save version".to_owned());
+        }
+        if let Some(inventory) = &save.inventory {
+            let owner = save
+                .owner_key
+                .as_ref()
+                .ok_or("Inventory snapshot has no owner")?;
+            if owner.server_id != self.storage_server_id {
+                return Err("Inventory belongs to another server".to_owned());
+            }
+            let inventory = ItemInventory::from_counts(
+                &self.craft_catalog,
+                inventory.counts().iter().map(|(&id, &num)| (id, num)),
+            )
+            .map_err(|error| error.to_string())?;
+            save.craft_queue
+                .validate(&self.craft_catalog)
+                .map_err(|error| error.to_string())?;
+            if save.craft_queue.entries.len() > 5 {
+                return Err("Saved production queue exceeds native mock capacity".to_owned());
+            }
+            if let Some(player) = self
+                .players
+                .values_mut()
+                .find(|player| player.account_name == owner.account_name && !player.is_bot)
+            {
+                player.inventory = inventory;
+                player.craft_queue = save.craft_queue.clone();
+            } else {
+                self.saved_production.insert(
+                    owner.account_name.clone(),
+                    (inventory, save.craft_queue.clone()),
+                );
+            }
+        }
+        let owner_id = save
+            .owner_key
+            .as_ref()
+            .and_then(|owner| {
+                self.players
+                    .values()
+                    .find(|player| player.account_name == owner.account_name && !player.is_bot)
+                    .map(|player| player.player_id)
+            })
+            .unwrap_or(0);
+        let replaced_ids: Vec<_> = self
+            .structures
+            .iter()
+            .filter(|structure| {
+                (owner_id != 0 && structure.owner_id == owner_id)
+                    || save.owner_key.as_ref().is_some_and(|owner| {
+                        self.detached_building_owners.get(&structure.id)
+                            == Some(&owner.account_name)
+                    })
+            })
+            .map(|structure| structure.id)
+            .collect();
+        self.structures
+            .retain(|structure| !replaced_ids.contains(&structure.id));
+        for id in replaced_ids {
+            self.generator_fuels.remove(&id);
+            self.generator_active.remove(&id);
+            self.detached_building_owners.remove(&id);
+        }
         for entry in &save.structures {
             let kind = BuildPieceKind::from_u8(entry.kind);
             let id = self.next_build_id;
             self.next_build_id = self.next_build_id.wrapping_add(1);
             self.structures.push(ReplicatedStructure {
                 id,
-                owner_id: 1,
+                owner_id,
                 kind,
                 tier: entry.tier.clamp(1, 4),
                 pos: Vec3::new(entry.x, entry.y, entry.z),
                 rot_steps: entry.yaw_steps & 3,
                 hp: entry.hp.max(1),
-                max_hp: entry.max_hp.max(kind.max_hp_for_tier(entry.tier.clamp(1, 4))),
+                max_hp: entry
+                    .max_hp
+                    .max(kind.max_hp_for_tier(entry.tier.clamp(1, 4))),
                 is_open: entry.is_open,
             });
+            if owner_id == 0
+                && let Some(owner) = &save.owner_key
+            {
+                self.detached_building_owners
+                    .insert(id, owner.account_name.clone());
+            }
             if kind == BuildPieceKind::Generator {
                 let fuel = if entry.fuel > 0 {
                     f32::from(entry.fuel)
@@ -1076,15 +1364,31 @@ impl ServerWorld {
                     f32::from(save.generator_fuel.max(200))
                 };
                 self.generator_fuels.insert(id, fuel);
-                self.generator_active.insert(id, entry.is_open || fuel > 0.0);
+                self.generator_active
+                    .insert(id, entry.is_open || fuel > 0.0);
             }
         }
         self.world_rev = self.world_rev.wrapping_add(1);
+        Ok(())
     }
 
     /// Advances simulation by `dt` and computes interest-filtered snapshots per connected human client.
     pub fn step_and_build_snapshots(&mut self, dt: f32) -> Vec<(SocketAddr, PacketKind)> {
         self.tick = self.tick.wrapping_add(1);
+        for player in self.players.values_mut().filter(|player| !player.is_bot) {
+            match player.craft_queue.advance(
+                &self.craft_catalog,
+                &mut player.inventory,
+                f64::from(dt),
+            ) {
+                Ok(grants) if !grants.is_empty() => self.world_rev = self.world_rev.wrapping_add(1),
+                Ok(_) => {}
+                Err(error) => warn!(
+                    "Production queue for player {} could not advance: {error}",
+                    player.player_id
+                ),
+            }
+        }
         let t = self.tick as f32 * dt;
 
         for node in &mut self.nodes {
@@ -1198,7 +1502,11 @@ impl ServerWorld {
                         pos: [peer.pos.x, peer.pos.y, peer.pos.z],
                         yaw: peer.yaw,
                         anim_state: peer.anim_state,
-                        flags: if peer.is_bot { NetPlayerState::FLAG_BOT } else { 0 },
+                        flags: if peer.is_bot {
+                            NetPlayerState::FLAG_BOT
+                        } else {
+                            0
+                        },
                     });
                 }
             }
@@ -1318,18 +1626,57 @@ impl ServerWorld {
                     PacketKind::WorldStateSync {
                         world_rev: self.world_rev,
                         hp: viewer.hp,
-                        wood: viewer.wood,
-                        stone: viewer.stone,
-                        iron: viewer.iron,
-                        fiber: viewer.fiber,
-                        ammo: viewer.ammo,
-                        bandages: viewer.bandages,
+                        wood: viewer.wood(),
+                        stone: viewer.stone(),
+                        iron: viewer.iron(),
+                        fiber: viewer.fiber(),
+                        ammo: viewer.ammo(),
+                        bandages: viewer.bandages(),
                         base_power_pct: self.base_power_pct,
                         structures,
                         nodes,
                         enemies,
                         drops,
                         vehicles,
+                    },
+                ));
+                let items: Vec<_> = viewer
+                    .inventory
+                    .counts()
+                    .iter()
+                    .map(|(&item_id, &num)| super::protocol::NetInventoryItemDto { item_id, num })
+                    .collect();
+                let page_size = super::protocol::MAX_INVENTORY_ITEMS_PER_PAGE;
+                let page_count = items.len().div_ceil(page_size).max(1);
+                for page_index in 0..page_count {
+                    let start = page_index * page_size;
+                    let end = (start + page_size).min(items.len());
+                    out.push((
+                        addr,
+                        PacketKind::InventorySnapshot {
+                            revision: self.world_rev,
+                            page_index: page_index as u16,
+                            page_count: page_count as u16,
+                            items: items[start..end].to_vec(),
+                        },
+                    ));
+                }
+                out.push((
+                    addr,
+                    PacketKind::CraftStateSync {
+                        server_tick: self.tick,
+                        queue: viewer
+                            .craft_queue
+                            .entries
+                            .iter()
+                            .map(|entry| super::protocol::NetCraftQueueDto {
+                                drawing_id: entry.drawing_id,
+                                remaining_count: entry.remaining_count,
+                                remaining_ms: (entry.remaining_seconds * 1000.0).ceil() as u32,
+                                batch_ms: (entry.batch_seconds * 1000.0).ceil() as u32,
+                                facility_id: entry.facility_id,
+                            })
+                            .collect(),
                     },
                 ));
             }
@@ -1420,6 +1767,21 @@ impl NetServerHandle {
                     self.world
                         .apply_world_op(&src, op, target_id, param_a, param_b, pos);
                 }
+                PacketKind::CraftRequest {
+                    request_id,
+                    drawing_id,
+                    create_num,
+                    near_building_instance_id,
+                } => {
+                    let reply = self.world.apply_craft_request(
+                        &src,
+                        request_id,
+                        drawing_id,
+                        create_num,
+                        near_building_instance_id,
+                    );
+                    self.send_to(src, reply);
+                }
                 PacketKind::Disconnect => {
                     self.world.remove_addr(&src);
                 }
@@ -1474,6 +1836,13 @@ pub struct NetClientState {
     pub fiber: u32,
     pub ammo: u16,
     pub bandages: u16,
+    pub inventory: BTreeMap<i32, i32>,
+    pub craft_queue: Vec<super::protocol::NetCraftQueueDto>,
+    pub craft_status: String,
+    inventory_assembler: super::inventory::InventoryAssembler,
+    last_craft_tick: Option<u32>,
+    craft_request_seq: u32,
+    pending_crafts: HashMap<u32, (PacketKind, u64)>,
     pub structures: HashMap<u32, ReplicatedStructure>,
     pub damaged_node_hps: HashMap<u16, u16>,
     pub enemies: HashMap<u16, ReplicatedEnemy>,
@@ -1507,6 +1876,13 @@ impl Default for NetClientState {
             fiber: 30,
             ammo: 60,
             bandages: 2,
+            inventory: BTreeMap::new(),
+            craft_queue: Vec::new(),
+            craft_status: String::new(),
+            inventory_assembler: super::inventory::InventoryAssembler::default(),
+            last_craft_tick: None,
+            craft_request_seq: 0,
+            pending_crafts: HashMap::new(),
             structures: HashMap::new(),
             damaged_node_hps: HashMap::new(),
             enemies: HashMap::new(),
@@ -1557,6 +1933,13 @@ impl NetClientState {
         self.fiber = 30;
         self.ammo = 60;
         self.bandages = 2;
+        self.inventory.clear();
+        self.craft_queue.clear();
+        self.craft_status.clear();
+        self.inventory_assembler = super::inventory::InventoryAssembler::default();
+        self.last_craft_tick = None;
+        self.pending_crafts.clear();
+        self.craft_request_seq = 0;
         self.last_status = format!("Connecting UDP -> {addr}");
         self.last_hello_ms = self.elapsed_ms();
         self.send_kind(PacketKind::Hello {
@@ -1608,7 +1991,8 @@ impl NetClientState {
         desired_lang: i32,
     ) -> Result<(), String> {
         let target_addr = if srv.is_local_loopback {
-            let server = NetServerHandle::bind("127.0.0.1:0", &srv.name)?;
+            let mut server = NetServerHandle::bind("127.0.0.1:0", &srv.name)?;
+            server.world.storage_server_id = srv.id;
             let addr = server.local_addr();
             commands.insert_resource(server);
             addr
@@ -1622,9 +2006,9 @@ impl NetClientState {
                         srv.gate_url, srv.port
                     )
                 })?;
-            addrs.next().ok_or_else(|| {
-                format!("Resolved 0 addresses for {}:{}", srv.gate_url, srv.port)
-            })?
+            addrs
+                .next()
+                .ok_or_else(|| format!("Resolved 0 addresses for {}:{}", srv.gate_url, srv.port))?
         };
         self.server_name = srv.name.clone();
         if let Err(err) = self.connect(target_addr, client_version, account_name, desired_lang) {
@@ -1647,6 +2031,46 @@ impl NetClientState {
         });
     }
 
+    pub fn send_craft_request(
+        &mut self,
+        drawing_id: i32,
+        create_num: i32,
+        facility_id: i64,
+    ) -> Result<u32, String> {
+        if self.phase != ClientLinkPhase::Connected {
+            return Err("Connect before requesting production".to_owned());
+        }
+        if drawing_id <= 0 || create_num <= 0 {
+            return Err("Choose a recipe and a positive quantity".to_owned());
+        }
+        if self.pending_crafts.len() >= 128 {
+            return Err("Waiting for production acknowledgments".to_owned());
+        }
+        self.craft_request_seq = self.craft_request_seq.wrapping_add(1);
+        let request_id = self.craft_request_seq;
+        let packet = PacketKind::CraftRequest {
+            request_id,
+            drawing_id,
+            create_num,
+            near_building_instance_id: facility_id,
+        };
+        self.pending_crafts
+            .insert(request_id, (packet.clone(), self.elapsed_ms()));
+        self.send_kind(packet);
+        self.craft_status = "Sending production request".to_owned();
+        Ok(request_id)
+    }
+
+    fn apply_inventory_projection(&mut self) {
+        let amount = |id| self.inventory.get(&id).copied().unwrap_or(0);
+        self.wood = amount(WOOD_ITEM_ID) as u32;
+        self.stone = amount(STONE_ITEM_ID) as u32;
+        self.iron = amount(IRON_ITEM_ID) as u32;
+        self.fiber = amount(CLOTH_ITEM_ID) as u32;
+        self.ammo = amount(RIFLE_AMMO_ITEM_ID).min(i32::from(u16::MAX)) as u16;
+        self.bandages = amount(BANDAGE_ITEM_ID).min(i32::from(u16::MAX)) as u16;
+    }
+
     pub fn local_player_state(&self) -> Option<&NetPlayerState> {
         self.local_player_id
             .and_then(|id| self.visible_peers.get(&id))
@@ -1660,7 +2084,10 @@ impl NetClientState {
         let now_ms = self.elapsed_ms();
         let mut buf = [0_u8; 2048];
         let mut received = Vec::new();
-        while let Ok((len, _src)) = sock.recv_from(&mut buf) {
+        while let Ok((len, src)) = sock.recv_from(&mut buf) {
+            if Some(src) != self.target_addr {
+                continue;
+            }
             if let Ok(env) = decode_packet(&buf[..len]) {
                 received.push(env);
             }
@@ -1725,6 +2152,11 @@ impl NetClientState {
                     drops,
                     vehicles,
                 } => {
+                    if world_rev != self.world_rev
+                        && !super::inventory::revision_is_newer(world_rev, self.world_rev)
+                    {
+                        continue;
+                    }
                     self.world_rev = world_rev;
                     self.hp = hp;
                     self.wood = wood;
@@ -1733,6 +2165,15 @@ impl NetClientState {
                     self.fiber = fiber;
                     self.ammo = ammo;
                     self.bandages = bandages;
+                    if self
+                        .inventory_assembler
+                        .committed_revision()
+                        .is_some_and(|revision| {
+                            !super::inventory::revision_is_newer(world_rev, revision)
+                        })
+                    {
+                        self.apply_inventory_projection();
+                    }
                     self.base_power_pct = base_power_pct;
                     self.structures.clear();
                     for dto in structures {
@@ -1816,8 +2257,54 @@ impl NetClientState {
                         );
                     }
                 }
+                PacketKind::InventorySnapshot {
+                    revision,
+                    page_index,
+                    page_count,
+                    items,
+                } => {
+                    if let Some(counts) = self
+                        .inventory_assembler
+                        .receive(revision, page_index, page_count, items)
+                    {
+                        self.inventory = counts;
+                        self.apply_inventory_projection();
+                    }
+                }
+                PacketKind::CraftStateSync { server_tick, queue } => {
+                    if self
+                        .last_craft_tick
+                        .is_none_or(|tick| super::inventory::revision_is_newer(server_tick, tick))
+                    {
+                        self.last_craft_tick = Some(server_tick);
+                        self.craft_queue = queue;
+                    }
+                }
+                PacketKind::CraftResult {
+                    request_id,
+                    accepted: _,
+                    reason,
+                } if self.pending_crafts.remove(&request_id).is_some() => {
+                    self.craft_status = reason;
+                }
                 _ => {}
             }
+        }
+
+        let retries: Vec<_> = self
+            .pending_crafts
+            .values_mut()
+            .filter_map(|(packet, sent_ms)| {
+                if now_ms.saturating_sub(*sent_ms) >= 250 {
+                    *sent_ms = now_ms;
+                    Some(packet.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for packet in retries {
+            self.send_kind(packet);
         }
 
         if self.phase == ClientLinkPhase::Connecting
@@ -1860,7 +2347,10 @@ impl NetClientState {
 pub fn run_headless_server(bind_addr: &str) {
     let server = match NetServerHandle::bind(bind_addr, "BevyZero Dedicated 100P") {
         Ok(s) => {
-            info!("Headless 100-player UDP server listening on {}", s.local_addr());
+            info!(
+                "Headless 100-player UDP server listening on {}",
+                s.local_addr()
+            );
             s
         }
         Err(err) => {
@@ -1870,9 +2360,11 @@ pub fn run_headless_server(bind_addr: &str) {
     };
 
     App::new()
-        .add_plugins(MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(
-            Duration::from_secs_f64(1.0 / TICK_HZ),
-        )))
+        .add_plugins(
+            MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(
+                1.0 / TICK_HZ,
+            ))),
+        )
         .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
         .insert_resource(server)
         .add_systems(FixedUpdate, step_embedded_server_system)
@@ -1886,5 +2378,353 @@ pub fn step_embedded_server_system(
 ) {
     if let Some(mut server) = server_opt {
         server.poll_and_step(time.delta_secs());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn accepted(kind: PacketKind) -> bool {
+        let PacketKind::CraftResult { accepted, .. } = kind else {
+            panic!("production result");
+        };
+        accepted
+    }
+
+    fn world_with_player() -> (ServerWorld, SocketAddr, u16) {
+        let mut world = ServerWorld::new("Native production test");
+        let address = "127.0.0.1:31042".parse().unwrap();
+        let player_id = world
+            .accept_or_reject_client(address, "Account_A".to_owned())
+            .unwrap();
+        (world, address, player_id)
+    }
+
+    #[test]
+    fn native_craft_datagram_preserves_id_count_and_retry_never_charges_twice() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut client = NetClientState {
+            socket: Some(UdpSocket::bind("127.0.0.1:0").unwrap()),
+            target_addr: Some(receiver.local_addr().unwrap()),
+            phase: ClientLinkPhase::Connected,
+            ..default()
+        };
+        let request_id = client.send_craft_request(57100, 3, -1).unwrap();
+        let mut packet = [0u8; 1500];
+        let (length, source) = receiver.recv_from(&mut packet).unwrap();
+        let PacketKind::CraftRequest {
+            request_id: received_id,
+            drawing_id,
+            create_num,
+            near_building_instance_id,
+        } = decode_packet(&packet[..length]).unwrap().kind
+        else {
+            panic!("native production request");
+        };
+        assert_eq!(
+            (
+                received_id,
+                drawing_id,
+                create_num,
+                near_building_instance_id
+            ),
+            (request_id, 57100, 3, -1)
+        );
+        let mut world = ServerWorld::new("Datagram production");
+        let player_id = world
+            .accept_or_reject_client(source, "Producer".to_owned())
+            .unwrap();
+        assert!(accepted(world.apply_craft_request(
+            &source, request_id, drawing_id, create_num, -1
+        )));
+        assert_eq!(
+            world.players[&player_id].inventory.amount(CLOTH_ITEM_ID),
+            15
+        );
+        assert_eq!(
+            world.players[&player_id].inventory.amount(BANDAGE_ITEM_ID),
+            2
+        );
+        assert!(accepted(world.apply_craft_request(
+            &source, request_id, drawing_id, create_num, -1
+        )));
+        assert_eq!(
+            world.players[&player_id].inventory.amount(CLOTH_ITEM_ID),
+            15
+        );
+        assert_eq!(world.players[&player_id].craft_queue.entries.len(), 1);
+        assert!(!accepted(
+            world.apply_craft_request(&source, request_id, 57089, 1, -1)
+        ));
+        world.step_and_build_snapshots(0.999);
+        assert_eq!(
+            world.players[&player_id].inventory.amount(BANDAGE_ITEM_ID),
+            2
+        );
+        world.step_and_build_snapshots(0.002);
+        assert_eq!(
+            world.players[&player_id].inventory.amount(BANDAGE_ITEM_ID),
+            3
+        );
+        world.step_and_build_snapshots(2.0);
+        assert_eq!(
+            world.players[&player_id].inventory.amount(BANDAGE_ITEM_ID),
+            5
+        );
+        assert!(world.players[&player_id].craft_queue.entries.is_empty());
+        let before = world.players[&player_id].inventory.clone();
+        for (id, drawing, num) in [
+            (2, 777777, 1),
+            (3, 57100, 0),
+            (4, 57100, -1),
+            (5, 57100, 1000),
+        ] {
+            assert!(!accepted(
+                world.apply_craft_request(&source, id, drawing, num, -1)
+            ));
+            assert_eq!(world.players[&player_id].inventory, before);
+        }
+        world.apply_world_op(
+            &source,
+            super::super::protocol::OP_CRAFT_RECIPE,
+            1,
+            0,
+            0,
+            [0.0; 3],
+        );
+        assert_eq!(world.players[&player_id].inventory, before);
+    }
+
+    #[test]
+    fn native_mock_queue_allows_five_entries_then_rejects_without_cost() {
+        let (mut world, address, player_id) = world_with_player();
+        for id in 1..=5 {
+            assert!(accepted(
+                world.apply_craft_request(&address, id, 57100, 1, -1)
+            ));
+        }
+        let before = world.players[&player_id].inventory.clone();
+        assert!(!accepted(
+            world.apply_craft_request(&address, 6, 57100, 1, -1)
+        ));
+        assert_eq!(world.players[&player_id].inventory, before);
+        assert_eq!(world.players[&player_id].craft_queue.entries.len(), 5);
+        world.step_and_build_snapshots(5.0);
+        assert_eq!(
+            world.players[&player_id].inventory.amount(BANDAGE_ITEM_ID),
+            7
+        );
+    }
+
+    #[test]
+    fn workbench_must_be_live_and_within_native_four_point_five_radius() {
+        let (mut world, address, player_id) = world_with_player();
+        world
+            .players
+            .get_mut(&player_id)
+            .unwrap()
+            .grant(&world.craft_catalog, &[(50017, 5)]);
+        let player_pos = world.players[&player_id].pos;
+        world.structures.push(ReplicatedStructure {
+            id: 41,
+            owner_id: player_id,
+            kind: BuildPieceKind::Workbench,
+            tier: 2,
+            pos: player_pos + Vec3::X * 4.6,
+            rot_steps: 0,
+            hp: 100,
+            max_hp: 100,
+            is_open: false,
+        });
+        let before = world.players[&player_id].inventory.clone();
+        assert!(!accepted(
+            world.apply_craft_request(&address, 1, 57021, 1, 41)
+        ));
+        assert_eq!(world.players[&player_id].inventory, before);
+        world.structures[0].pos = player_pos + Vec3::X * 4.4;
+        assert!(!accepted(
+            world.apply_craft_request(&address, 2, 57021, 1, 9999)
+        ));
+        assert_eq!(world.players[&player_id].inventory, before);
+        assert!(accepted(
+            world.apply_craft_request(&address, 3, 57021, 1, 41)
+        ));
+        assert_eq!(
+            world.players[&player_id].craft_queue.entries[0].facility_id,
+            41
+        );
+        assert_eq!(world.players[&player_id].inventory.amount(50017), 0);
+        assert_eq!(world.players[&player_id].inventory.amount(IRON_ITEM_ID), 15);
+    }
+
+    #[test]
+    fn complete_native_inventory_replicates_over_real_udp_without_byte_id_aliases() {
+        let mut server = NetServerHandle::bind("127.0.0.1:0", "Inventory UDP").unwrap();
+        let mut client = NetClientState::default();
+        client
+            .connect(server.local_addr(), "3.14.0.0", "Producer", 8)
+            .unwrap();
+        for _ in 0..8 {
+            server.poll_and_step(0.0);
+            client.poll_receive("Producer", "3.14.0.0", 8);
+        }
+        let player_id = client.local_player_id.unwrap();
+        let ids: Vec<_> = server
+            .world
+            .craft_catalog
+            .items
+            .keys()
+            .take(300)
+            .copied()
+            .collect();
+        let amounts: Vec<_> = ids
+            .iter()
+            .map(|id| ItemAmount {
+                item_id: *id,
+                num: 2,
+            })
+            .collect();
+        server
+            .world
+            .players
+            .get_mut(&player_id)
+            .unwrap()
+            .inventory
+            .add_atomic(&server.world.craft_catalog, &amounts)
+            .unwrap();
+        server.world.world_rev += 1;
+        for _ in 0..4 {
+            server.poll_and_step(0.0);
+            client.poll_receive("Producer", "3.14.0.0", 8);
+        }
+        for id in ids {
+            assert_eq!(
+                client.inventory[&id],
+                server.world.players[&player_id].inventory.amount(id)
+            );
+        }
+        client.send_craft_request(57100, 1, -1).unwrap();
+        for _ in 0..4 {
+            server.poll_and_step(0.0);
+            client.poll_receive("Producer", "3.14.0.0", 8);
+        }
+        assert_eq!(client.inventory[&CLOTH_ITEM_ID], 25);
+        assert_eq!(client.craft_queue[0].drawing_id, 57100);
+        server.poll_and_step(1.0);
+        client.poll_receive("Producer", "3.14.0.0", 8);
+        assert_eq!(client.inventory[&BANDAGE_ITEM_ID], 3);
+        assert!(client.craft_queue.is_empty());
+        assert!(client.pending_crafts.is_empty());
+    }
+
+    #[test]
+    fn production_save_retains_progress_and_isolates_accounts_and_servers() {
+        let (mut world, address, player_id) = world_with_player();
+        world.storage_server_id = 12;
+        assert!(accepted(
+            world.apply_craft_request(&address, 1, 57089, 1, -1)
+        ));
+        world.step_and_build_snapshots(3.0);
+        let saved = world.export_saved_base(player_id);
+        assert_eq!(saved.craft_queue.entries[0].remaining_seconds, 5.0);
+        let raw = serde_json::to_string(&saved).unwrap();
+        let decoded = serde_json::from_str(&raw).unwrap();
+        let mut restored = ServerWorld::new("Restore test");
+        assert!(restored.import_saved_base(&decoded).is_err());
+        restored.storage_server_id = 12;
+        restored.import_saved_base(&decoded).unwrap();
+        let other_address = "127.0.0.1:31043".parse().unwrap();
+        let other_id = restored
+            .accept_or_reject_client(other_address, "Account_B".to_owned())
+            .unwrap();
+        assert!(restored.players[&other_id].craft_queue.entries.is_empty());
+        let original_id = restored
+            .accept_or_reject_client(address, "Account_A".to_owned())
+            .unwrap();
+        assert_eq!(
+            restored.players[&original_id]
+                .inventory
+                .amount(WOOD_ITEM_ID),
+            70
+        );
+        restored.step_and_build_snapshots(5.0);
+        assert_eq!(restored.players[&original_id].inventory.amount(55001), 1);
+        assert_eq!(restored.players[&other_id].inventory.amount(55001), 0);
+        assert_ne!(
+            restored.saved_base_path(original_id),
+            restored.saved_base_path(other_id)
+        );
+    }
+
+    #[test]
+    fn account_changes_cannot_transfer_inventory_and_reconnect_keeps_paid_queue() {
+        let (mut world, address, player_id) = world_with_player();
+        assert!(accepted(
+            world.apply_craft_request(&address, 1, 57089, 1, -1)
+        ));
+        world.step_and_build_snapshots(3.0);
+        let inventory = world.players[&player_id].inventory.clone();
+        assert_eq!(
+            world.accept_or_reject_client(address, "Account_B".to_owned()),
+            Err("account_changed_reconnect")
+        );
+        assert_eq!(world.players[&player_id].inventory, inventory);
+        world.remove_addr(&address);
+        let other_id = world
+            .accept_or_reject_client(address, "Account_B".to_owned())
+            .unwrap();
+        assert!(world.players[&other_id].craft_queue.entries.is_empty());
+        assert_eq!(world.players[&other_id].inventory.amount(WOOD_ITEM_ID), 120);
+        let new_address = "127.0.0.1:31111".parse().unwrap();
+        let restored_id = world
+            .accept_or_reject_client(new_address, "Account_A".to_owned())
+            .unwrap();
+        assert_eq!(world.players[&restored_id].inventory, inventory);
+        assert_eq!(
+            world.players[&restored_id].craft_queue.entries[0].remaining_seconds,
+            5.0
+        );
+        world.step_and_build_snapshots(5.0);
+        assert_eq!(world.players[&restored_id].inventory.amount(55001), 1);
+    }
+
+    #[test]
+    fn scoped_base_exports_only_owned_structures_and_restores_the_correct_peer() {
+        let (mut world, address, player_id) = world_with_player();
+        let other_address = "127.0.0.1:31112".parse().unwrap();
+        let other_id = world
+            .accept_or_reject_client(other_address, "Account_B".to_owned())
+            .unwrap();
+        for (id, owner_id) in [(10, player_id), (20, other_id)] {
+            world.structures.push(ReplicatedStructure {
+                id,
+                owner_id,
+                kind: BuildPieceKind::Foundation,
+                tier: 1,
+                pos: Vec3::new(f32::from(owner_id), 0.0, 0.0),
+                rot_steps: 0,
+                hp: 100,
+                max_hp: 100,
+                is_open: false,
+            });
+        }
+        let saved = world.export_saved_base(player_id);
+        assert_eq!(saved.structures.len(), 1);
+        assert_eq!(saved.structures[0].x, f32::from(player_id));
+        let mut restored = ServerWorld::new("Owner restore");
+        restored.import_saved_base(&saved).unwrap();
+        let other_id = restored
+            .accept_or_reject_client(other_address, "Account_B".to_owned())
+            .unwrap();
+        let owner_id = restored
+            .accept_or_reject_client(address, "Account_A".to_owned())
+            .unwrap();
+        assert_ne!(owner_id, other_id);
+        assert_eq!(restored.structures[0].owner_id, owner_id);
+        assert!(restored.export_saved_base(other_id).structures.is_empty());
     }
 }

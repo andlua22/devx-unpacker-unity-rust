@@ -5,9 +5,7 @@
 //! so Unity UI traversal, PPtr resolution, texture decoding, and coordinate math exist in one place.
 
 use crate::prefab::resolve_pptr_ref;
-use devx_codecs::animation::{
-    DecodedUiAnimationClip, decode_ui_animation_clip, unity_path_crc32,
-};
+use devx_codecs::animation::{DecodedUiAnimationClip, decode_ui_animation_clip, unity_path_crc32};
 use devx_codecs::texture::{TextureDecodeOptions, decode_sprite_cached, decode_texture2d};
 use devx_plugin_api::{AssetRef, DecodedImage};
 use devx_unity_io::{
@@ -204,6 +202,13 @@ pub struct UiWidgetPropsDto {
     pub is_on: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scroll_hv: Option<[bool; 2]>,
+    /// Native UIScrollPanel cell stride, independent of the template artwork dimensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll_cell_size: Option<[f32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll_rows: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll_cols: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub char_limit: Option<i32>,
     #[serde(default)]
@@ -218,6 +223,18 @@ pub struct UiScriptBindingDto {
     pub slot_index: Option<usize>,
     pub target_name: String,
     pub target_go_ref: AssetRef,
+    /// Controller owner path relative to the panel root; an empty string identifies the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_path: Option<String>,
+    /// Exact target's hierarchy path relative to the panel root (not a name-based lookup).
+    /// Duplicate sibling names can share a path; `target_go_ref` remains authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_go_ref: Option<AssetRef>,
+    /// Distinguishes multiple controller components even when they share an owner GameObject.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_component_ref: Option<AssetRef>,
 }
 
 /// One node in an extracted uGUI `RectTransform` hierarchy.
@@ -235,7 +252,19 @@ pub struct UiCanvasNode {
     pub size_delta: [f32; 2],
     pub pivot: [f32; 2],
     pub scale: [f32; 3],
+    /// Local Z rotation in top-down canvas degrees (Unity's counter-clockwise angle negated).
     pub rotation_z_deg: f32,
+    /// Cumulative top-down artwork rotation after ancestor transforms, separate from scale flips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas_rotation_z_deg: Option<f32>,
+    /// Artwork rectangle before applying `canvas_rotation_z_deg`, centered in canvas space.
+    /// Unlike `canvas_rect` (the world AABB), its dimensions retain the transformed axis lengths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas_render_rect: Option<[f32; 4]>,
+    /// Parent affine basis columns mapping native Unity anchored-position deltas into
+    /// top-down canvas deltas, including ancestor rotation and signed scale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas_parent_basis: Option<[[f32; 2]; 2]>,
     /// Resolved rectangle `[x, y, width, height]` in top-down canvas coordinates.
     pub canvas_rect: [f32; 4],
     /// Resolved rectangle `[x, y, width, height]` relative to parent's top-left corner.
@@ -290,6 +319,9 @@ impl Default for UiCanvasNode {
             pivot: [0.5, 0.5],
             scale: [1.0, 1.0, 1.0],
             rotation_z_deg: 0.0,
+            canvas_rotation_z_deg: None,
+            canvas_render_rect: None,
+            canvas_parent_basis: None,
             canvas_rect: [0.0; 4],
             local_rect: [0.0; 4],
             flip_x: false,
@@ -379,7 +411,8 @@ pub struct ExtractedUiCanvas {
 #[derive(Default)]
 pub struct UiExtractionCache {
     backing_textures: HashMap<(usize, i64), DecodedImage>,
-    resolved_textures: HashMap<(AssetRef, bool), Result<(UiTextureAssetMeta, DecodedImage), String>>,
+    resolved_textures:
+        HashMap<(AssetRef, bool), Result<(UiTextureAssetMeta, DecodedImage), String>>,
     script_names: HashMap<AssetRef, String>,
 }
 
@@ -430,7 +463,8 @@ pub fn extract_ui_canvas_cached(
     let has_ui = stats.has_canvas_component
         || stats.graphic_count > 0
         || stats.interactive_count > 0
-        || (stats.rect_transform_count > 0 && (stats.canvas_renderer_count > 0 || stats.node_count > 1));
+        || (stats.rect_transform_count > 0
+            && (stats.canvas_renderer_count > 0 || stats.node_count > 1));
     if !has_ui {
         return None;
     }
@@ -486,6 +520,8 @@ pub fn recompute_ui_layout(doc: &mut UiCanvasDocument, width: f32, height: f32) 
         y0_bu: 0.0,
         sx: 1.0,
         sy: 1.0,
+        x_axis: [1.0, 0.0],
+        y_axis: [0.0, 1.0],
         canvas_h: ref_h,
     };
     recompute_node_recursive(
@@ -507,7 +543,18 @@ struct UiCanvasMapping {
     y0_bu: f32,
     sx: f32,
     sy: f32,
+    x_axis: [f32; 2],
+    y_axis: [f32; 2],
     canvas_h: f32,
+}
+
+impl UiCanvasMapping {
+    fn transform_point(self, x: f32, y_bu: f32) -> [f32; 2] {
+        [
+            self.x0 + x * self.x_axis[0] + y_bu * self.y_axis[0],
+            self.y0_bu + x * self.x_axis[1] + y_bu * self.y_axis[1],
+        ]
+    }
 }
 
 fn norm_ui_scale(s: f32) -> f32 {
@@ -529,7 +576,10 @@ fn populate_preferred_sizes_tree(node: &UiCanvasNode, memo: &mut HashMap<usize, 
     measure_preferred_size_memo(node, memo);
 }
 
-fn measure_preferred_size_memo(node: &UiCanvasNode, memo: &mut HashMap<usize, [f32; 2]>) -> [f32; 2] {
+fn measure_preferred_size_memo(
+    node: &UiCanvasNode,
+    memo: &mut HashMap<usize, [f32; 2]>,
+) -> [f32; 2] {
     let key = (node as *const UiCanvasNode) as usize;
     if let Some(&v) = memo.get(&key) {
         return v;
@@ -539,9 +589,7 @@ fn measure_preferred_size_memo(node: &UiCanvasNode, memo: &mut HashMap<usize, [f
     let mut measured = if let Some(ref lg) = node.layout_group {
         let mut child_sizes: Vec<[f32; 2]> = Vec::new();
         for ch in &node.children {
-            if ch.active_self
-                && !ch.layout_element.as_ref().is_some_and(|e| e.ignore_layout)
-            {
+            if ch.active_self && !ch.layout_element.as_ref().is_some_and(|e| e.ignore_layout) {
                 let mut sz = measure_preferred_size_memo(ch, memo);
                 if lg.child_scale_width {
                     sz[0] *= ch.scale[0].abs();
@@ -590,9 +638,7 @@ fn measure_preferred_size_memo(node: &UiCanvasNode, memo: &mut HashMap<usize, [f
         };
         [pl + pr + iw, pt + pb + ih]
     } else if let Some(UiGraphic::Text {
-        text,
-        font_size,
-        ..
+        text, font_size, ..
     }) = node.graphic.as_ref()
     {
         measure_text_intrinsic(text, *font_size, base_sd)
@@ -635,8 +681,7 @@ fn recompute_node_recursive(
     } else {
         parent_alpha
     };
-    node.effective_alpha =
-        (base_alpha * node.canvas_group_alpha.unwrap_or(1.0)).clamp(0.0, 1.0);
+    node.effective_alpha = (base_alpha * node.canvas_group_alpha.unwrap_or(1.0)).clamp(0.0, 1.0);
 
     let [pw, ph] = parent_unscaled_size;
     // Solve node rectangle in parent's unscaled local coordinates (top-down [x, y, w, h]).
@@ -719,26 +764,48 @@ fn recompute_node_recursive(
     let piv_ux = lu + cw * node.pivot[0];
     let piv_uy_bu = bu + ch * node.pivot[1];
 
-    let piv_cx = parent_map.x0 + piv_ux * parent_map.sx;
-    let piv_cy_bu = parent_map.y0_bu + piv_uy_bu * parent_map.sy;
+    let [piv_cx, piv_cy_bu] = parent_map.transform_point(piv_ux, piv_uy_bu);
     let csx = norm_ui_scale(parent_map.sx * node.scale[0]);
     let csy = norm_ui_scale(parent_map.sy * node.scale[1]);
+    // RectTransform children live in their parent's rotated local frame. Carry the full affine
+    // basis; rotating only the final graphic loses container pivots and clipping positions.
+    let (sin, cos) = (-node.rotation_z_deg).to_radians().sin_cos();
+    let sin = norm_ui_scale(sin);
+    let cos = norm_ui_scale(cos);
+    let x_axis = [
+        (parent_map.x_axis[0] * cos + parent_map.y_axis[0] * sin) * node.scale[0],
+        (parent_map.x_axis[1] * cos + parent_map.y_axis[1] * sin) * node.scale[0],
+    ];
+    let y_axis = [
+        (-parent_map.x_axis[0] * sin + parent_map.y_axis[0] * cos) * node.scale[1],
+        (-parent_map.x_axis[1] * sin + parent_map.y_axis[1] * cos) * node.scale[1],
+    ];
     let node_map = UiCanvasMapping {
-        x0: piv_cx - (node.pivot[0] * cw) * csx,
-        y0_bu: piv_cy_bu - (node.pivot[1] * ch) * csy,
+        x0: piv_cx - node.pivot[0] * cw * x_axis[0] - node.pivot[1] * ch * y_axis[0],
+        y0_bu: piv_cy_bu - node.pivot[0] * cw * x_axis[1] - node.pivot[1] * ch * y_axis[1],
         sx: csx,
         sy: csy,
+        x_axis,
+        y_axis,
         canvas_h: parent_map.canvas_h,
     };
 
-    let cx0 = node_map.x0;
-    let cx1 = node_map.x0 + cw * csx;
-    let cy0_bu = node_map.y0_bu;
-    let cy1_bu = node_map.y0_bu + ch * csy;
-    let left = cx0.min(cx1);
-    let right = cx0.max(cx1);
-    let bottom = cy0_bu.min(cy1_bu);
-    let top_bu = cy0_bu.max(cy1_bu);
+    let corners = [
+        node_map.transform_point(0.0, 0.0),
+        node_map.transform_point(cw, 0.0),
+        node_map.transform_point(0.0, ch),
+        node_map.transform_point(cw, ch),
+    ];
+    let left = corners.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min);
+    let right = corners
+        .iter()
+        .map(|p| p[0])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bottom = corners.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
+    let top_bu = corners
+        .iter()
+        .map(|p| p[1])
+        .fold(f32::NEG_INFINITY, f32::max);
     let canvas_rect = [
         left,
         parent_map.canvas_h - top_bu,
@@ -759,6 +826,25 @@ fn recompute_node_recursive(
     };
     node.flip_x = csx < 0.0;
     node.flip_y = csy < 0.0;
+    // Remove the X-scale reflection when deriving artwork rotation so a 180-degree parent
+    // rotation does not also become a texture flip, and a negative scale remains a flip.
+    let x_sign = if node.flip_x { -1.0 } else { 1.0 };
+    node.canvas_rotation_z_deg = Some(norm_ui_scale(
+        -(x_axis[1] * x_sign).atan2(x_axis[0] * x_sign).to_degrees(),
+    ));
+    let [center_x, center_y_bu] = node_map.transform_point(cw * 0.5, ch * 0.5);
+    let render_w = cw * x_axis[0].hypot(x_axis[1]);
+    let render_h = ch * y_axis[0].hypot(y_axis[1]);
+    node.canvas_render_rect = Some([
+        center_x - render_w * 0.5,
+        parent_map.canvas_h - center_y_bu - render_h * 0.5,
+        render_w,
+        render_h,
+    ]);
+    node.canvas_parent_basis = Some([
+        [parent_map.x_axis[0], -parent_map.x_axis[1]],
+        [parent_map.y_axis[0], -parent_map.y_axis[1]],
+    ]);
 
     let child_overrides = compute_layout_group_child_rects(node, [0.0, 0.0, cw, ch], pref_memo);
     let active_here = node.active_in_hierarchy;
@@ -856,13 +942,21 @@ fn compute_layout_group_child_rects(
         .map(|&ci| {
             let ch = &parent.children[ci];
             let ckey = (ch as *const UiCanvasNode) as usize;
-            let pref = pref_memo.get(&ckey).copied().unwrap_or([
-                ch.size_delta[0].max(0.0),
-                ch.size_delta[1].max(0.0),
-            ]);
+            let pref = pref_memo
+                .get(&ckey)
+                .copied()
+                .unwrap_or([ch.size_delta[0].max(0.0), ch.size_delta[1].max(0.0)]);
             let solved = solve_rect_transform_top_down(ch, iw.max(pref[0]), ih.max(pref[1]));
-            let mut w = if lg.child_control_width { pref[0] } else { solved[2] };
-            let mut h = if lg.child_control_height { pref[1] } else { solved[3] };
+            let mut w = if lg.child_control_width {
+                pref[0]
+            } else {
+                solved[2]
+            };
+            let mut h = if lg.child_control_height {
+                pref[1]
+            } else {
+                solved[3]
+            };
             if lg.child_scale_width {
                 w *= ch.scale[0].abs();
             }
@@ -882,15 +976,16 @@ fn compute_layout_group_child_rects(
         let sum_h: f32 = sizes.iter().map(|s| s[1]).sum();
         let total_h = sum_h + if n > 1 { sy * (n - 1) as f32 } else { 0.0 };
         let extra_h = (ih - total_h).max(0.0);
-        let mut cursor_y = if lg.child_control_height && lg.child_force_expand_height && extra_h > 0.5 {
-            let add = extra_h / n as f32;
-            for sz in &mut sizes {
-                sz[1] += add;
-            }
-            iy
-        } else {
-            iy + ay * extra_h
-        };
+        let mut cursor_y =
+            if lg.child_control_height && lg.child_force_expand_height && extra_h > 0.5 {
+                let add = extra_h / n as f32;
+                for sz in &mut sizes {
+                    sz[1] += add;
+                }
+                iy
+            } else {
+                iy + ay * extra_h
+            };
         for (&ci, sz) in active_indices.iter().zip(sizes.iter()) {
             let cx = ix + ax * (iw - sz[0]);
             out[ci] = Some([cx, cursor_y, sz[0], sz[1]]);
@@ -905,7 +1000,8 @@ fn compute_layout_group_child_rects(
         let sum_w: f32 = sizes.iter().map(|s| s[0]).sum();
         let total_w = sum_w + if n > 1 { sx * (n - 1) as f32 } else { 0.0 };
         let extra_w = (iw - total_w).max(0.0);
-        let mut cursor_x = if lg.child_control_width && lg.child_force_expand_width && extra_w > 0.5 {
+        let mut cursor_x = if lg.child_control_width && lg.child_force_expand_width && extra_w > 0.5
+        {
             let add = extra_w / n as f32;
             for sz in &mut sizes {
                 sz[0] += add;
@@ -979,10 +1075,7 @@ pub fn solve_rect_transform_top_down(node: &UiCanvasNode, pw: f32, ph: f32) -> [
     [left, top, width, height]
 }
 
-fn infer_reference_resolution(
-    scaler_ref: Option<[f32; 2]>,
-    root: &UiCanvasNode,
-) -> (f32, f32) {
+fn infer_reference_resolution(scaler_ref: Option<[f32; 2]>, root: &UiCanvasNode) -> (f32, f32) {
     if let Some([w, h]) = scaler_ref
         && w >= 64.0
         && h >= 64.0
@@ -1028,19 +1121,107 @@ fn parse_rect_offset(val: Option<&UnityValue>) -> [f32; 4] {
     [left, top, right, bottom]
 }
 
-fn collect_node_go_map(node: &UiCanvasNode, out: &mut HashMap<AssetRef, String>) {
-    out.insert(node.go_ref, node.name.clone());
-    for ch in &node.children {
-        collect_node_go_map(ch, out);
+fn collect_scroll_panel_props(
+    obj: &UnityObject,
+    script_name: &str,
+    enabled: bool,
+    meta: &mut CollectedUiCompMeta,
+) -> bool {
+    if script_name != "UIScrollPanel"
+        && !(script_name.is_empty()
+            && obj.get("CellSize").is_some()
+            && obj.get("rows").is_some()
+            && obj.get("cols").is_some()
+            && obj.get("useOrig").is_some())
+    {
+        return false;
     }
+    if enabled {
+        let props = meta.widget_props.get_or_insert_with(Default::default);
+        props.scroll_cell_size = obj.get("CellSize").and_then(extract_vec2);
+        props.scroll_rows = obj.get("rows").and_then(extract_i32_field);
+        props.scroll_cols = obj.get("cols").and_then(extract_i32_field);
+    }
+    true
+}
+
+struct UiBindingNodeIdentity {
+    name: String,
+    path: String,
+}
+
+fn collect_node_go_map(
+    node: &UiCanvasNode,
+    path: &str,
+    out: &mut HashMap<AssetRef, UiBindingNodeIdentity>,
+) {
+    out.insert(
+        node.go_ref,
+        UiBindingNodeIdentity {
+            name: node.name.clone(),
+            path: path.to_owned(),
+        },
+    );
+    for ch in &node.children {
+        let child_path = if path.is_empty() {
+            ch.name.clone()
+        } else {
+            format!("{path}/{}", ch.name)
+        };
+        collect_node_go_map(ch, &child_path, out);
+    }
+}
+
+struct ResolvedUiBinding<'a> {
+    script_name: &'a str,
+    field_name: &'a str,
+    slot_index: Option<usize>,
+    owner_go_ref: AssetRef,
+    owner_component_ref: AssetRef,
+    target_go_ref: AssetRef,
+}
+
+type UiBindingIdentity = (AssetRef, String, Option<usize>, AssetRef);
+
+fn append_resolved_ui_binding(
+    source: ResolvedUiBinding<'_>,
+    go_map: &HashMap<AssetRef, UiBindingNodeIdentity>,
+    bindings: &mut Vec<UiScriptBindingDto>,
+    seen: &mut HashSet<UiBindingIdentity>,
+) {
+    let Some(owner) = go_map.get(&source.owner_go_ref) else {
+        return;
+    };
+    let Some(target) = go_map.get(&source.target_go_ref) else {
+        return;
+    };
+    if !seen.insert((
+        source.owner_component_ref,
+        source.field_name.to_owned(),
+        source.slot_index,
+        source.target_go_ref,
+    )) {
+        return;
+    }
+    bindings.push(UiScriptBindingDto {
+        script_name: source.script_name.to_owned(),
+        field_name: source.field_name.to_owned(),
+        slot_index: source.slot_index,
+        target_name: target.name.clone(),
+        target_go_ref: source.target_go_ref,
+        owner_path: Some(owner.path.clone()),
+        target_path: Some(target.path.clone()),
+        owner_go_ref: Some(source.owner_go_ref),
+        owner_component_ref: Some(source.owner_component_ref),
+    });
 }
 
 fn collect_subtree_bindings_recursive(
     workspace: &UnityWorkspaceData,
     node: &UiCanvasNode,
-    go_map: &HashMap<AssetRef, String>,
+    go_map: &HashMap<AssetRef, UiBindingNodeIdentity>,
     bindings: &mut Vec<UiScriptBindingDto>,
-    seen: &mut HashSet<(String, String, Option<usize>, AssetRef)>,
+    seen: &mut HashSet<UiBindingIdentity>,
 ) {
     if bindings.len() >= 2048 {
         return;
@@ -1122,17 +1303,20 @@ fn collect_subtree_bindings_recursive(
                     _ => Vec::new(),
                 };
                 for (slot_index, target_ref) in p_refs {
-                    if let Some(go_target) = resolve_game_object_from_comp(workspace, target_ref)
-                        && let Some(t_name) = go_map.get(&go_target)
-                        && seen.insert((script_name.clone(), field.clone(), slot_index, go_target))
-                    {
-                        bindings.push(UiScriptBindingDto {
-                            script_name: script_name.clone(),
-                            field_name: field.clone(),
-                            slot_index,
-                            target_name: t_name.clone(),
-                            target_go_ref: go_target,
-                        });
+                    if let Some(go_target) = resolve_game_object_from_comp(workspace, target_ref) {
+                        append_resolved_ui_binding(
+                            ResolvedUiBinding {
+                                script_name: &script_name,
+                                field_name: field,
+                                slot_index,
+                                owner_go_ref: node.go_ref,
+                                owner_component_ref: comp_ref,
+                                target_go_ref: go_target,
+                            },
+                            go_map,
+                            bindings,
+                            seen,
+                        );
                         if bindings.len() >= 2048 {
                             return;
                         }
@@ -1148,7 +1332,7 @@ fn collect_subtree_bindings_recursive(
 
 fn populate_script_bindings(workspace: &UnityWorkspaceData, doc: &mut UiCanvasDocument) {
     let mut go_map = HashMap::new();
-    collect_node_go_map(&doc.root, &mut go_map);
+    collect_node_go_map(&doc.root, "", &mut go_map);
     let mut bindings = Vec::new();
     let mut seen = HashSet::new();
     collect_subtree_bindings_recursive(workspace, &doc.root, &go_map, &mut bindings, &mut seen);
@@ -1182,7 +1366,7 @@ fn collect_ui_clips_recursive(
     workspace: &UnityWorkspaceData,
     node: &UiCanvasNode,
     root_prefix: &str,
-    seen_clips: &mut HashSet<AssetRef>,
+    seen_clips: &mut HashSet<(AssetRef, AssetRef)>,
     out: &mut Vec<DecodedUiAnimationClip>,
 ) {
     let mut clip_refs: Vec<(AssetRef, bool)> = Vec::new();
@@ -1217,8 +1401,7 @@ fn collect_ui_clips_recursive(
                     {
                         clip_refs.push((cr, true));
                     }
-                    if let Some(arr) = comp_obj.get("m_Animations").and_then(UnityValue::as_array)
-                    {
+                    if let Some(arr) = comp_obj.get("m_Animations").and_then(UnityValue::as_array) {
                         for item in arr {
                             if let Some(cr) = resolve_pptr_ref(workspace, comp_ref.file_index, item)
                             {
@@ -1239,33 +1422,20 @@ fn collect_ui_clips_recursive(
         crc_to_root_path.insert(unity_path_crc32(""), root_prefix.to_owned());
         collect_relative_paths_crc_map(node, "", root_prefix, &mut crc_to_root_path);
 
-        for (clip_ref, legacy_hint) in clip_refs {
-            if out.len() >= 16 || !seen_clips.insert(clip_ref) {
-                continue;
-            }
-            let Some(clip_obj) = read_workspace_object(workspace, clip_ref) else {
-                continue;
-            };
-            if clip_obj.info.type_id != 74 {
-                continue;
-            }
-            if let Ok(mut decoded) = decode_ui_animation_clip(&clip_obj)
-                && !decoded.tracks.is_empty()
-            {
-                // Animator loops by default when wrap_mode == 0 inside looping UI emblems.
-                if !legacy_hint && decoded.wrap_mode == 0 {
-                    decoded.wrap_mode = 2;
+        append_ui_owner_clips(
+            node.go_ref,
+            &clip_refs,
+            seen_clips,
+            &crc_to_root_path,
+            out,
+            |clip_ref| {
+                let clip_obj = read_workspace_object(workspace, clip_ref)?;
+                if clip_obj.info.type_id != 74 {
+                    return None;
                 }
-                for track in &mut decoded.tracks {
-                    if let Some(resolved) = crc_to_root_path.get(&track.path_hash)
-                        && !resolved.is_empty()
-                    {
-                        track.path_name = Some(resolved.clone());
-                    }
-                }
-                out.push(decoded);
-            }
-        }
+                decode_ui_animation_clip(&clip_obj).ok()
+            },
+        );
     }
 
     for ch in &node.children {
@@ -1276,6 +1446,49 @@ fn collect_ui_clips_recursive(
         };
         collect_ui_clips_recursive(workspace, ch, &next_prefix, seen_clips, out);
     }
+}
+
+fn append_ui_owner_clips(
+    owner_go_ref: AssetRef,
+    clip_refs: &[(AssetRef, bool)],
+    seen_clips: &mut HashSet<(AssetRef, AssetRef)>,
+    crc_to_root_path: &HashMap<u32, String>,
+    out: &mut Vec<DecodedUiAnimationClip>,
+    mut decode: impl FnMut(AssetRef) -> Option<DecodedUiAnimationClip>,
+) {
+    // The extracted panel's node bound and its finite native clip references bound this
+    // traversal. A fixed clip-count cap drops late controller/legacy animations. Scope
+    // deduplication to the owner as one clip can animate different relative hierarchies.
+    for &(clip_ref, legacy_hint) in clip_refs {
+        if !seen_clips.insert((owner_go_ref, clip_ref)) {
+            continue;
+        }
+        if let Some(decoded) = decode(clip_ref) {
+            append_bound_ui_clip(decoded, legacy_hint, crc_to_root_path, out);
+        }
+    }
+}
+
+fn append_bound_ui_clip(
+    mut decoded: DecodedUiAnimationClip,
+    legacy_hint: bool,
+    crc_to_root_path: &HashMap<u32, String>,
+    out: &mut Vec<DecodedUiAnimationClip>,
+) {
+    if decoded.tracks.is_empty() {
+        return;
+    }
+    // Animator loops by default when wrap_mode == 0 inside looping UI emblems.
+    if !legacy_hint && decoded.wrap_mode == 0 {
+        decoded.wrap_mode = 2;
+    }
+    for track in &mut decoded.tracks {
+        if let Some(resolved) = crc_to_root_path.get(&track.path_hash) {
+            // The empty path is the panel root, not an unresolved target.
+            track.path_name = Some(resolved.clone());
+        }
+    }
+    out.push(decoded);
 }
 
 fn populate_ui_animations(workspace: &UnityWorkspaceData, doc: &mut UiCanvasDocument) {
@@ -1351,11 +1564,8 @@ impl<'a> ExtractContext<'a> {
                             self.stats.rect_transform_count += 1;
                         }
                         rect_ref = Some(comp_ref);
-                        child_transform_refs = collect_children_refs(
-                            self.workspace,
-                            comp_ref.file_index,
-                            &comp_obj,
-                        );
+                        child_transform_refs =
+                            collect_children_refs(self.workspace, comp_ref.file_index, &comp_obj);
                         rect_obj = Some(comp_obj);
                     }
                 }
@@ -1365,7 +1575,8 @@ impl<'a> ExtractContext<'a> {
                 223 => {
                     has_canvas = true;
                     self.stats.has_canvas_component = true;
-                    if let Some(order) = comp_obj.get("m_SortingOrder").and_then(extract_i32_field) {
+                    if let Some(order) = comp_obj.get("m_SortingOrder").and_then(extract_i32_field)
+                    {
                         canvas_sorting_order = Some(order);
                     }
                 }
@@ -1380,8 +1591,7 @@ impl<'a> ExtractContext<'a> {
                     }
                 }
                 114 => {
-                    let script_name =
-                        self.resolve_script_name(comp_ref.file_index, &comp_obj);
+                    let script_name = self.resolve_script_name(comp_ref.file_index, &comp_obj);
                     let enabled = extract_bool_prop(&comp_obj, "m_Enabled").unwrap_or(true);
                     self.classify_ui_monobehaviour(
                         comp_ref.file_index,
@@ -1462,6 +1672,9 @@ impl<'a> ExtractContext<'a> {
             pivot,
             scale,
             rotation_z_deg,
+            canvas_rotation_z_deg: None,
+            canvas_render_rect: None,
+            canvas_parent_basis: None,
             canvas_rect: [0.0; 4],
             local_rect: [0.0; 4],
             flip_x: scale[0] < 0.0,
@@ -1497,6 +1710,12 @@ impl<'a> ExtractContext<'a> {
     ) {
         let sname = script_name.unwrap_or("");
 
+        // Custom UIScrollPanel supplies dynamic-list geometry to the sibling ScrollRect.
+        // Keep its stride separate from both the viewport and template artwork bounds.
+        if collect_scroll_panel_props(obj, sname, enabled, meta) {
+            return;
+        }
+
         // 1. CanvasScaler (record reference resolution when found near/at root)
         if sname == "CanvasScaler"
             || (obj.get("m_ReferenceResolution").is_some() && obj.get("m_UiScaleMode").is_some())
@@ -1526,7 +1745,8 @@ impl<'a> ExtractContext<'a> {
         if sname == "Mask" || obj.get("m_ShowMaskGraphic").is_some() {
             if enabled {
                 meta.clips_children = true;
-                meta.show_mask_graphic = extract_bool_prop(obj, "m_ShowMaskGraphic").unwrap_or(true);
+                meta.show_mask_graphic =
+                    extract_bool_prop(obj, "m_ShowMaskGraphic").unwrap_or(true);
             }
             return;
         }
@@ -1570,14 +1790,17 @@ impl<'a> ExtractContext<'a> {
                         .and_then(extract_i32_field)
                         .unwrap_or(0)
                         .clamp(0, 8) as u8,
-                    child_control_width: extract_bool_prop(obj, "m_ChildControlWidth").unwrap_or(true),
-                    child_control_height: extract_bool_prop(obj, "m_ChildControlHeight").unwrap_or(true),
+                    child_control_width: extract_bool_prop(obj, "m_ChildControlWidth")
+                        .unwrap_or(true),
+                    child_control_height: extract_bool_prop(obj, "m_ChildControlHeight")
+                        .unwrap_or(true),
                     child_force_expand_width: extract_bool_prop(obj, "m_ChildForceExpandWidth")
                         .unwrap_or(true),
                     child_force_expand_height: extract_bool_prop(obj, "m_ChildForceExpandHeight")
                         .unwrap_or(true),
                     child_scale_width: extract_bool_prop(obj, "m_ChildScaleWidth").unwrap_or(false),
-                    child_scale_height: extract_bool_prop(obj, "m_ChildScaleHeight").unwrap_or(false),
+                    child_scale_height: extract_bool_prop(obj, "m_ChildScaleHeight")
+                        .unwrap_or(false),
                     reverse_arrangement: extract_bool_prop(obj, "m_ReverseArrangement")
                         .unwrap_or(false),
                     cell_size: [100.0, 100.0],
@@ -1603,7 +1826,10 @@ impl<'a> ExtractContext<'a> {
                 meta.layout_group = Some(UiLayoutGroupDto {
                     kind: UiLayoutGroupKind::Grid,
                     padding: parse_rect_offset(obj.get("m_Padding")),
-                    spacing: obj.get("m_Spacing").and_then(extract_vec2).unwrap_or([0.0, 0.0]),
+                    spacing: obj
+                        .get("m_Spacing")
+                        .and_then(extract_vec2)
+                        .unwrap_or([0.0, 0.0]),
                     child_alignment: obj
                         .get("m_ChildAlignment")
                         .and_then(extract_i32_field)
@@ -1702,7 +1928,10 @@ impl<'a> ExtractContext<'a> {
                         .and_then(extract_i32_field)
                         .unwrap_or(0)
                         .clamp(0, 4) as u8,
-                    ratio: obj.get("m_AspectRatio").and_then(extract_f32).unwrap_or(1.0),
+                    ratio: obj
+                        .get("m_AspectRatio")
+                        .and_then(extract_f32)
+                        .unwrap_or(1.0),
                 });
             }
             return;
@@ -1711,8 +1940,17 @@ impl<'a> ExtractContext<'a> {
         // 4b. Interactive widgets & Selectable states
         if matches!(
             sname,
-            "Button" | "EmptyButton" | "RadioButton" | "Toggle" | "Slider" | "Scrollbar"
-                | "InputField" | "TMP_InputField" | "Dropdown" | "TMP_Dropdown" | "ScrollRect"
+            "Button"
+                | "EmptyButton"
+                | "RadioButton"
+                | "Toggle"
+                | "Slider"
+                | "Scrollbar"
+                | "InputField"
+                | "TMP_InputField"
+                | "Dropdown"
+                | "TMP_Dropdown"
+                | "ScrollRect"
         ) || (obj.get("m_Transition").is_some() && obj.get("m_Colors").is_some())
         {
             if enabled {
@@ -1727,7 +1965,10 @@ impl<'a> ExtractContext<'a> {
             }
             let props = meta.widget_props.get_or_insert_with(Default::default);
             if let Some(c) = obj.get("m_Colors").and_then(UnityValue::as_object) {
-                let norm = c.get("m_NormalColor").and_then(extract_rgba).unwrap_or([1.0; 4]);
+                let norm = c
+                    .get("m_NormalColor")
+                    .and_then(extract_rgba)
+                    .unwrap_or([1.0; 4]);
                 let high = c
                     .get("m_HighlightedColor")
                     .and_then(extract_rgba)
@@ -1772,8 +2013,7 @@ impl<'a> ExtractContext<'a> {
         }
 
         // 5. RawImage (must come before Image!)
-        if sname == "RawImage"
-            || (obj.get("m_Texture").is_some() && obj.get("m_UVRect").is_some())
+        if sname == "RawImage" || (obj.get("m_Texture").is_some() && obj.get("m_UVRect").is_some())
         {
             if meta.graphic.is_none() {
                 let color = obj
@@ -2008,14 +2248,23 @@ impl<'a> ExtractContext<'a> {
                 target.file_index
             ));
         };
-        let Some(info) = loaded.file.objects.iter().find(|o| o.path_id == target.path_id) else {
+        let Some(info) = loaded
+            .file
+            .objects
+            .iter()
+            .find(|o| o.path_id == target.path_id)
+        else {
             return Err(format!(
                 "UI asset {}:{} not found in loaded bundle '{}'",
                 target.file_index, target.path_id, loaded.virtual_path
             ));
         };
-        let obj = read_object(loaded, info)
-            .map_err(|e| format!("UI asset {}:{} read error: {e}", target.file_index, target.path_id))?;
+        let obj = read_object(loaded, info).map_err(|e| {
+            format!(
+                "UI asset {}:{} read error: {e}",
+                target.file_index, target.path_id
+            )
+        })?;
         let ver = loaded.file.unity_version.as_str();
         let key = make_texture_key(target);
 
@@ -2029,7 +2278,14 @@ impl<'a> ExtractContext<'a> {
                 self.tpk,
                 &mut self.cache.backing_textures,
             )
-            .map_err(|e| format!("Sprite '{}' ({}:{}): {e}", sp_label(&obj), target.file_index, target.path_id))?;
+            .map_err(|e| {
+                format!(
+                    "Sprite '{}' ({}:{}): {e}",
+                    sp_label(&obj),
+                    target.file_index,
+                    target.path_id
+                )
+            })?;
             let meta = UiTextureAssetMeta {
                 key,
                 name: if sp.name.is_empty() {
@@ -2046,8 +2302,13 @@ impl<'a> ExtractContext<'a> {
             };
             Ok((meta, sp.image))
         } else if obj.info.type_id == 28 {
-            let img = decode_texture2d(&obj, ver, &self.workspace.streams, TextureDecodeOptions::default())
-                .map_err(|e| format!("Texture2D {}:{}: {e}", target.file_index, target.path_id))?;
+            let img = decode_texture2d(
+                &obj,
+                ver,
+                &self.workspace.streams,
+                TextureDecodeOptions::default(),
+            )
+            .map_err(|e| format!("Texture2D {}:{}: {e}", target.file_index, target.path_id))?;
             let name = extract_string_prop(&obj, "m_Name")
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| format!("Texture_{}", target.path_id));
@@ -2188,7 +2449,10 @@ fn collect_go_component_refs(
     };
     let mut out = Vec::with_capacity(arr.len());
     for item in arr {
-        if let Some(pptr_val) = item.as_object().and_then(|m| m.get("component")).or(Some(item))
+        if let Some(pptr_val) = item
+            .as_object()
+            .and_then(|m| m.get("component"))
+            .or(Some(item))
             && let Some(r) = resolve_pptr_ref(workspace, file_index, pptr_val)
         {
             out.push(r);
@@ -2428,10 +2692,22 @@ fn extract_vec3(v: &UnityValue) -> Option<[f32; 3]> {
 fn extract_rgba(v: &UnityValue) -> Option<[f32; 4]> {
     let map = v.as_object()?;
     Some([
-        map.get("r").and_then(extract_f32).unwrap_or(1.0).clamp(0.0, 1.0),
-        map.get("g").and_then(extract_f32).unwrap_or(1.0).clamp(0.0, 1.0),
-        map.get("b").and_then(extract_f32).unwrap_or(1.0).clamp(0.0, 1.0),
-        map.get("a").and_then(extract_f32).unwrap_or(1.0).clamp(0.0, 1.0),
+        map.get("r")
+            .and_then(extract_f32)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0),
+        map.get("g")
+            .and_then(extract_f32)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0),
+        map.get("b")
+            .and_then(extract_f32)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0),
+        map.get("a")
+            .and_then(extract_f32)
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0),
     ])
 }
 
@@ -2473,6 +2749,59 @@ fn has_nonzero_pptr(val: Option<&UnityValue>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_panel_stride_survives_alongside_scroll_rect_properties() {
+        use indexmap::IndexMap;
+        use unity_asset_binary::asset::types::ObjectInfo;
+        use unity_asset_core::UnityClass;
+
+        let mut class = UnityClass::new(114, "MonoBehaviour".into(), "1".into());
+        let mut size = IndexMap::new();
+        size.insert("x".into(), UnityValue::Float(110.0));
+        size.insert("y".into(), UnityValue::Float(160.0));
+        class.set("CellSize".into(), UnityValue::Object(size));
+        class.set("rows".into(), UnityValue::Integer(1));
+        class.set("cols".into(), UnityValue::Integer(5));
+        class.set("useOrig".into(), UnityValue::Integer(1));
+        let obj = UnityObject::from_info_and_class(ObjectInfo::new(1, 0, 0, 114, 0), class);
+        let mut meta = CollectedUiCompMeta {
+            widget_kind: Some("ScrollRect".into()),
+            widget_props: Some(UiWidgetPropsDto {
+                scroll_hv: Some([true, false]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(collect_scroll_panel_props(
+            &obj,
+            "UIScrollPanel",
+            true,
+            &mut meta
+        ));
+        let props = meta.widget_props.as_ref().unwrap();
+        assert_eq!(props.scroll_cell_size, Some([110.0, 160.0]));
+        assert_eq!(props.scroll_rows, Some(1));
+        assert_eq!(props.scroll_cols, Some(5));
+        assert_eq!(props.scroll_hv, Some([true, false]));
+        assert_eq!(meta.widget_kind.as_deref(), Some("ScrollRect"));
+
+        let mut disabled = CollectedUiCompMeta::default();
+        assert!(collect_scroll_panel_props(
+            &obj,
+            "UIScrollPanel",
+            false,
+            &mut disabled
+        ));
+        assert!(disabled.widget_props.is_none());
+        assert!(!collect_scroll_panel_props(
+            &obj,
+            "OtherList",
+            true,
+            &mut disabled
+        ));
+        assert!(collect_scroll_panel_props(&obj, "", true, &mut disabled));
+    }
 
     fn dummy_node(name: &str) -> UiCanvasNode {
         UiCanvasNode {
@@ -2549,7 +2878,10 @@ mod tests {
 
         let mut doc = UiCanvasDocument {
             name: "TestCanvas".into(),
-            root_ref: AssetRef { file_index: 0, path_id: 1 },
+            root_ref: AssetRef {
+                file_index: 0,
+                path_id: 1,
+            },
             selected_ref: None,
             source_bundle: "ui/testpanel.ab".into(),
             reference_width: 1280.0,
@@ -2571,7 +2903,11 @@ mod tests {
         assert!((ch.effective_alpha - 0.25).abs() < 1e-4);
         assert!(ch.flip_x && !ch.flip_y);
         // pivot (0, 1) mirrored by scale.x = -1 flips box left by width 400
-        assert!((ch.canvas_rect[1] - 25.0).abs() < 1e-3, "rect={:?}", ch.canvas_rect);
+        assert!(
+            (ch.canvas_rect[1] - 25.0).abs() < 1e-3,
+            "rect={:?}",
+            ch.canvas_rect
+        );
         assert!((ch.canvas_rect[2] - 400.0).abs() < 1e-3);
         assert!((ch.canvas_rect[3] - 120.0).abs() < 1e-3);
 
@@ -2625,7 +2961,10 @@ mod tests {
 
         let mut doc = UiCanvasDocument {
             name: "LoginStack".into(),
-            root_ref: AssetRef { file_index: 0, path_id: 1 },
+            root_ref: AssetRef {
+                file_index: 0,
+                path_id: 1,
+            },
             selected_ref: None,
             source_bundle: "ui/loginpanel.ab".into(),
             reference_width: 1920.0,
@@ -2642,7 +2981,11 @@ mod tests {
 
         recompute_ui_layout(&mut doc, 1920.0, 1080.0);
         let l = &doc.root.children[0];
-        assert!((l.canvas_rect[0] - 1793.0).abs() < 1e-3, "got {:?}", l.canvas_rect);
+        assert!(
+            (l.canvas_rect[0] - 1793.0).abs() < 1e-3,
+            "got {:?}",
+            l.canvas_rect
+        );
         assert!((l.canvas_rect[1] - 9.0).abs() < 1e-3);
         assert!((l.canvas_rect[2] - 100.0).abs() < 1e-3);
         assert!((l.canvas_rect[3] - 400.0).abs() < 1e-3);
@@ -2687,7 +3030,10 @@ mod tests {
 
         let mut doc = UiCanvasDocument {
             name: "GridTest".into(),
-            root_ref: AssetRef { file_index: 0, path_id: 1 },
+            root_ref: AssetRef {
+                file_index: 0,
+                path_id: 1,
+            },
             selected_ref: None,
             source_bundle: "ui/establishpanel.ab".into(),
             reference_width: 1920.0,
@@ -2745,7 +3091,10 @@ mod tests {
 
         let mut doc = UiCanvasDocument {
             name: "ScaleAndAspect".into(),
-            root_ref: AssetRef { file_index: 0, path_id: 1 },
+            root_ref: AssetRef {
+                file_index: 0,
+                path_id: 1,
+            },
             selected_ref: None,
             source_bundle: "ui/test.ab".into(),
             reference_width: 1000.0,
@@ -2763,9 +3112,21 @@ mod tests {
         recompute_ui_layout(&mut doc, 1000.0, 1000.0);
         let scaled_ch = &doc.root.children[0].children[0];
         // Child size 200x100 scaled by parent 0.5 -> 100x50, shifted right by 40*0.5 = 20
-        assert!((scaled_ch.canvas_rect[2] - 100.0).abs() < 1e-3, "got {:?}", scaled_ch.canvas_rect);
-        assert!((scaled_ch.canvas_rect[3] - 50.0).abs() < 1e-3, "got {:?}", scaled_ch.canvas_rect);
-        assert!((scaled_ch.canvas_rect[0] - 470.0).abs() < 1e-3, "got {:?}", scaled_ch.canvas_rect);
+        assert!(
+            (scaled_ch.canvas_rect[2] - 100.0).abs() < 1e-3,
+            "got {:?}",
+            scaled_ch.canvas_rect
+        );
+        assert!(
+            (scaled_ch.canvas_rect[3] - 50.0).abs() < 1e-3,
+            "got {:?}",
+            scaled_ch.canvas_rect
+        );
+        assert!(
+            (scaled_ch.canvas_rect[0] - 470.0).abs() < 1e-3,
+            "got {:?}",
+            scaled_ch.canvas_rect
+        );
 
         let collapsed_ch = &doc.root.children[1].children[0];
         assert_eq!(collapsed_ch.canvas_rect[2], 0.0);
@@ -2773,8 +3134,324 @@ mod tests {
 
         let env_node = &doc.root.children[2];
         // 1000x1000 container with aspect 2.0 envelope -> 2000x1000 centered at [-500, 0]
-        assert!((env_node.canvas_rect[2] - 2000.0).abs() < 1e-3, "got {:?}", env_node.canvas_rect);
+        assert!(
+            (env_node.canvas_rect[2] - 2000.0).abs() < 1e-3,
+            "got {:?}",
+            env_node.canvas_rect
+        );
         assert!((env_node.canvas_rect[3] - 1000.0).abs() < 1e-3);
         assert!((env_node.canvas_rect[0] + 500.0).abs() < 1e-3);
+    }
+
+    fn solve_test_tree(root: UiCanvasNode, width: f32, height: f32) -> UiCanvasNode {
+        let mut doc = UiCanvasDocument {
+            name: "AffineTest".into(),
+            root_ref: root.go_ref,
+            selected_ref: None,
+            source_bundle: "ui/test.ab".into(),
+            reference_width: width,
+            reference_height: height,
+            scale_mode: UiScaleMode::ScaleWithScreenSize,
+            match_width_or_height: 0.5,
+            root,
+            textures: Vec::new(),
+            script_bindings: Vec::new(),
+            animations: Vec::new(),
+            warnings: Vec::new(),
+            stats: UiCanvasStats::default(),
+        };
+        recompute_ui_layout(&mut doc, width, height);
+        doc.root
+    }
+
+    fn assert_rect_near(actual: [f32; 4], expected: [f32; 4]) {
+        for (a, e) in actual.into_iter().zip(expected) {
+            assert!(
+                (a - e).abs() < 0.01,
+                "rect {actual:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn main_panel_inverted_footer_preserves_clip_and_counter_rotated_content() {
+        // Native MainPanel RectTransforms from lite4.0.apk: down #4803366695391799825,
+        // holder #-586769002185424382, viewport #-7650491208077362982,
+        // middle #-5830785089162633314. The down quaternion is (0,0,1,0), not a scale flip.
+        let mut root = dummy_node("MainPanel");
+        root.has_canvas = true;
+        let mut down = dummy_node("down");
+        down.anchor_min = [0.5, 0.0];
+        down.anchor_max = down.anchor_min;
+        down.anchored_position = [-483.0, 81.0];
+        down.pivot = [0.0, 0.0];
+        down.rotation_z_deg = -180.0;
+        let mut holder = dummy_node("m_btns_holder");
+        holder.anchored_position = [-430.78, -73.9];
+        holder.size_delta = [1047.1608, 51.974655];
+        let mut viewport = dummy_node("Viewport");
+        viewport.anchor_min = [0.0, 0.0];
+        viewport.anchor_max = [1.0, 1.0];
+        viewport.anchored_position = [-1.6400146, 0.0];
+        viewport.size_delta = [-17.0, 9.263313];
+        viewport.pivot = [0.0, 1.0];
+        let mut middle = dummy_node("m_middle_btns");
+        middle.anchor_min = [0.0, 1.0];
+        middle.anchor_max = middle.anchor_min;
+        middle.anchored_position = [906.0, -5.0];
+        middle.size_delta = [887.0427, 45.26001];
+        middle.pivot = [0.0, 0.0];
+        middle.rotation_z_deg = -180.0;
+        viewport.children.push(middle);
+        holder.children.push(viewport);
+        down.children.push(holder);
+        root.children.push(down);
+
+        let root = solve_test_tree(root, 1920.0, 1080.0);
+        let down = &root.children[0];
+        let holder = &down.children[0];
+        let viewport = &holder.children[0];
+        let middle = &viewport.children[0];
+        assert_rect_near(down.canvas_rect, [377.0, 999.0, 100.0, 100.0]);
+        assert_rect_near(
+            holder.canvas_rect,
+            [334.1996, 949.1127, 1047.1608, 51.974655],
+        );
+        assert_rect_near(
+            viewport.canvas_rect,
+            [352.8396, 939.8494, 1030.1608, 61.237_97],
+        );
+        assert_rect_near(middle.canvas_rect, [477.0004, 950.8273, 887.0427, 45.26001]);
+        assert!(!down.flip_x && !down.flip_y);
+        assert_eq!(middle.canvas_rotation_z_deg, Some(0.0));
+        // The restored menu lies inside its actual clipping viewport, rather than 906 px outside.
+        assert!(middle.canvas_rect[0] >= viewport.canvas_rect[0]);
+        assert!(
+            middle.canvas_rect[0] + middle.canvas_rect[2]
+                <= viewport.canvas_rect[0] + viewport.canvas_rect[2]
+        );
+    }
+
+    #[test]
+    fn quarter_turn_propagates_pivot_and_rotation_to_descendants() {
+        let mut root = dummy_node("Canvas");
+        root.has_canvas = true;
+        let mut parent = dummy_node("RotatedParent");
+        parent.size_delta = [200.0, 100.0];
+        parent.pivot = [0.0, 1.0];
+        parent.rotation_z_deg = -90.0;
+        let mut child = dummy_node("Icon");
+        child.size_delta = [40.0, 20.0];
+        child.anchored_position = [20.0, 10.0];
+        parent.children.push(child);
+        root.children.push(parent);
+        let root = solve_test_tree(root, 1000.0, 1000.0);
+        let parent = &root.children[0];
+        let child = &parent.children[0];
+        assert_rect_near(parent.canvas_rect, [500.0, 300.0, 100.0, 200.0]);
+        assert_rect_near(child.canvas_rect, [530.0, 360.0, 20.0, 40.0]);
+        assert_eq!(child.canvas_rotation_z_deg, Some(-90.0));
+        assert_eq!(child.canvas_parent_basis, Some([[0.0, -1.0], [-1.0, 0.0]]));
+        assert_rect_near(
+            child.canvas_render_rect.expect("resolved artwork box"),
+            [520.0, 370.0, 40.0, 20.0],
+        );
+        assert!(!child.flip_x && !child.flip_y);
+    }
+
+    #[test]
+    fn zero_size_rect_transform_keeps_origin_for_sized_descendants() {
+        let mut root = dummy_node("Canvas");
+        root.has_canvas = true;
+        let mut line = dummy_node("m_ding");
+        line.anchor_min = [0.0, 1.0];
+        line.anchor_max = [1.0, 1.0];
+        line.size_delta = [0.0, 0.0];
+        line.pivot = [0.5, 1.0];
+        let mut right = dummy_node("you");
+        right.anchor_min = [1.0, 1.0];
+        right.anchor_max = right.anchor_min;
+        right.pivot = [1.0, 1.0];
+        line.children.push(right);
+        root.children.push(line);
+        let root = solve_test_tree(root, 1920.0, 1080.0);
+        assert_rect_near(root.children[0].canvas_rect, [0.0, 0.0, 1920.0, 0.0]);
+        assert_rect_near(
+            root.children[0].children[0].canvas_rect,
+            [1820.0, 0.0, 100.0, 100.0],
+        );
+    }
+
+    #[test]
+    fn reflected_parent_keeps_flip_separate_from_child_rotation() {
+        let mut root = dummy_node("Canvas");
+        root.has_canvas = true;
+        let mut parent = dummy_node("MirroredParent");
+        parent.scale = [-1.0, 1.0, 1.0];
+        let mut child = dummy_node("RotatedIcon");
+        child.size_delta = [40.0, 20.0];
+        child.rotation_z_deg = -90.0;
+        parent.children.push(child);
+        root.children.push(parent);
+        let root = solve_test_tree(root, 1000.0, 1000.0);
+        let child = &root.children[0].children[0];
+        assert!(child.flip_x && !child.flip_y);
+        assert_eq!(child.canvas_rotation_z_deg, Some(90.0));
+        assert_rect_near(child.canvas_rect, [490.0, 480.0, 20.0, 40.0]);
+        assert_rect_near(
+            child.canvas_render_rect.expect("resolved artwork box"),
+            [480.0, 490.0, 40.0, 20.0],
+        );
+    }
+
+    #[test]
+    fn script_binding_paths_keep_controller_owners_and_duplicate_name_targets() {
+        let make_ref = |id| AssetRef {
+            file_index: 0,
+            path_id: id,
+        };
+        let mut root = dummy_node("Panel");
+        root.go_ref = make_ref(1);
+        let mut root_text = dummy_node("Text");
+        root_text.go_ref = make_ref(2);
+        let mut first_cell = dummy_node("Cell");
+        first_cell.go_ref = make_ref(3);
+        let mut first_cell_text = dummy_node("Text");
+        first_cell_text.go_ref = make_ref(4);
+        first_cell.children.push(first_cell_text);
+        let mut second_cell = dummy_node("Cell");
+        second_cell.go_ref = make_ref(5);
+        let mut second_cell_text = dummy_node("Text");
+        second_cell_text.go_ref = make_ref(6);
+        second_cell.children.push(second_cell_text);
+        root.children = vec![root_text, first_cell, second_cell];
+        let mut go_map = HashMap::new();
+        collect_node_go_map(&root, "", &mut go_map);
+
+        let source = |owner, component, target| ResolvedUiBinding {
+            script_name: "GameObjectData",
+            field_name: "GameObjects",
+            slot_index: Some(0),
+            owner_go_ref: make_ref(owner),
+            owner_component_ref: make_ref(component),
+            target_go_ref: make_ref(target),
+        };
+        let mut bindings = Vec::new();
+        let mut seen = HashSet::new();
+        for (owner, component, target) in [(1, 10, 2), (3, 30, 4), (5, 50, 6), (5, 51, 2)] {
+            append_resolved_ui_binding(
+                source(owner, component, target),
+                &go_map,
+                &mut bindings,
+                &mut seen,
+            );
+        }
+        // Repeated visits to one component deduplicate, while another controller's identical
+        // field/slot/shared target remains a separate binding.
+        append_resolved_ui_binding(source(5, 51, 2), &go_map, &mut bindings, &mut seen);
+        assert_eq!(bindings.len(), 4);
+        assert_eq!(bindings[0].owner_path.as_deref(), Some(""));
+        assert_eq!(bindings[0].target_path.as_deref(), Some("Text"));
+        assert_eq!(bindings[1].owner_path.as_deref(), Some("Cell"));
+        assert_eq!(bindings[1].target_path.as_deref(), Some("Cell/Text"));
+        assert_eq!(bindings[2].target_path, bindings[1].target_path);
+        assert_ne!(bindings[2].target_go_ref, bindings[1].target_go_ref);
+        assert_eq!(bindings[3].owner_component_ref, Some(make_ref(51)));
+        assert_eq!(bindings[3].target_go_ref, bindings[0].target_go_ref);
+        // Source identity disambiguates both duplicate sibling paths and nested controller arrays.
+        assert_ne!(bindings[3].owner_go_ref, bindings[0].owner_go_ref);
+    }
+
+    #[test]
+    fn script_binding_identity_fields_are_optional_for_legacy_documents() {
+        let old = r#"{"script_name":"GameObjectData","field_name":"GameObjects","slot_index":0,"target_name":"Text","target_go_ref":{"file_index":0,"path_id":2}}"#;
+        let binding: UiScriptBindingDto = serde_json::from_str(old).expect("legacy binding schema");
+        assert!(binding.owner_path.is_none());
+        assert!(binding.target_path.is_none());
+        assert!(binding.owner_go_ref.is_none());
+        assert!(binding.owner_component_ref.is_none());
+        let serialized = serde_json::to_string(&binding).expect("binding serialization");
+        assert!(!serialized.contains("owner_path"));
+    }
+
+    #[test]
+    fn ui_clip_collection_keeps_late_footer_clips_and_shared_owner_instances() {
+        use devx_codecs::animation::{DecodedUiAnimTrack, UiAnimChannel};
+        let make_ref = |id| AssetRef {
+            file_index: 0,
+            path_id: id,
+        };
+        let mut names: Vec<String> = (0..16).map(|i| format!("ButtonState_{i}")).collect();
+        names.extend(
+            [
+                "DowntoUp",
+                "UptoDown",
+                "Mainpanel_chat_downtoup",
+                "Mainpanel_chat_uptodown",
+            ]
+            .map(str::to_owned),
+        );
+        let refs: Vec<_> = (1..=20).map(|id| (make_ref(id), true)).collect();
+        let decode = |clip_ref: AssetRef| {
+            Some(DecodedUiAnimationClip {
+                name: names[clip_ref.path_id as usize - 1].clone(),
+                duration_secs: 0.15,
+                sample_rate: 60.0,
+                wrap_mode: 0,
+                tracks: vec![DecodedUiAnimTrack {
+                    path_hash: 0,
+                    path_name: None,
+                    channel: UiAnimChannel::AnchoredPosY,
+                    times: vec![0.0, 0.15],
+                    values: vec![0.0, 50.0],
+                }],
+            })
+        };
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        let first_paths = HashMap::from([(0, "down/m_chat".to_owned())]);
+        append_ui_owner_clips(
+            make_ref(101),
+            &refs,
+            &mut seen,
+            &first_paths,
+            &mut out,
+            decode,
+        );
+        assert_eq!(out.len(), 20);
+        assert_eq!(
+            out.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            names.iter().collect::<Vec<_>>()
+        );
+        assert!(
+            out.iter()
+                .all(|c| c.tracks[0].path_name.as_deref() == Some("down/m_chat"))
+        );
+        // Repeated references on one owner deduplicate without suppressing another owner's
+        // instance of the same native clip; path hash zero also resolves the actual panel root.
+        append_ui_owner_clips(
+            make_ref(101),
+            &refs,
+            &mut seen,
+            &first_paths,
+            &mut out,
+            decode,
+        );
+        assert_eq!(out.len(), 20);
+        let root_paths = HashMap::from([(0, String::new())]);
+        append_ui_owner_clips(
+            make_ref(202),
+            &refs[..2],
+            &mut seen,
+            &root_paths,
+            &mut out,
+            decode,
+        );
+        assert_eq!(out.len(), 22);
+        assert!(
+            out[20..]
+                .iter()
+                .all(|c| c.tracks[0].path_name.as_deref() == Some(""))
+        );
     }
 }

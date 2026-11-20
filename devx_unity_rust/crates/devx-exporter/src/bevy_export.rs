@@ -795,8 +795,13 @@ fn collect_showcase_animation_clips(
                 continue;
             }
             if is_role_anim_bundle {
-                let explicit_hit =
-                    !anim_filters.is_empty() && matches_any_filter(&name_low, anim_filters);
+                let explicit_hit = anim_filters.iter().any(|filter| {
+                    if let Some(exact) = filter.trim().strip_prefix('=') {
+                        name_low.eq_ignore_ascii_case(exact)
+                    } else {
+                        matches_filter_pattern(&name_low, filter)
+                    }
+                });
                 if !explicit_hit && !is_core_role_showcase_clip(&name_low) {
                     continue;
                 }
@@ -1694,7 +1699,7 @@ use bevy::picking::Pickable;
 use bevy::prelude::*;
 use bevy::text::{FontSize, FontSource, Justify};
 use bevy::ui::widget::NodeImageMode;
-use bevy::ui::Pressed;
+use bevy::ui::{Pressed, UiTransform};
 use bevy::ui_widgets::{observe, Activate, Button};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -2646,6 +2651,12 @@ struct UiPanelNodeDto {
     #[serde(default)]
     canvas_rect: [f32; 4],
     #[serde(default)]
+    canvas_render_rect: Option<[f32; 4]>,
+    #[serde(default)]
+    canvas_rotation_z_deg: Option<f32>,
+    #[serde(default)]
+    rotation_z_deg: f32,
+    #[serde(default)]
     flip_x: bool,
     #[serde(default)]
     flip_y: bool,
@@ -2846,23 +2857,11 @@ fn spawn_ui_panel_nodes_depth_first(
         return;
     }
 
-    let [rx, ry, rw, rh] = node.canvas_rect;
+    let [_, _, rw, rh] = node.canvas_rect;
     let has_rect = rw >= 1.0 && rh >= 1.0;
     let draw_graphic = node.graphic_enabled && (!node.clips_children || node.show_mask_graphic);
 
     if has_rect && (draw_graphic && node.graphic.is_some() || node.is_interactive) {
-        let layout_node = Node {
-            position_type: PositionType::Absolute,
-            left: Val::Percent((rx / ref_w) * 100.0),
-            top: Val::Percent((ry / ref_h) * 100.0),
-            width: Val::Percent((rw / ref_w) * 100.0),
-            height: Val::Percent((rh / ref_h) * 100.0),
-            overflow: Overflow::clip(),
-            justify_content: JustifyContent::Center,
-            align_items: AlignItems::Center,
-            ..default()
-        };
-
         if let Some(ref g) = node.graphic.as_ref().filter(|_| draw_graphic) {
             match g {
                 UiPanelGraphicDto::Image {
@@ -2893,36 +2892,36 @@ fn spawn_ui_panel_nodes_depth_first(
                             }
                             spawn_ui_element(
                                 frame,
-                                layout_node,
-                                node.is_interactive,
-                                &node.name,
+                                node,
+                                ref_w,
+                                ref_h,
                                 Some(img_node),
                                 None,
                             );
                         } else if *missing_texture {
                             spawn_ui_element(
                                 frame,
-                                layout_node,
-                                node.is_interactive,
-                                &node.name,
+                                node,
+                                ref_w,
+                                ref_h,
                                 None,
                                 Some(Color::srgba(color[0], color[1], color[2], (alpha * 0.14).max(0.04))),
                             );
                         } else if color[0] > 0.90 && color[1] > 0.90 && color[2] > 0.90 && rw > 48.0 && rh > 48.0 {
                             spawn_ui_element(
                                 frame,
-                                layout_node,
-                                node.is_interactive,
-                                &node.name,
+                                node,
+                                ref_w,
+                                ref_h,
                                 None,
                                 None,
                             );
                         } else {
                             spawn_ui_element(
                                 frame,
-                                layout_node,
-                                node.is_interactive,
-                                &node.name,
+                                node,
+                                ref_w,
+                                ref_h,
                                 None,
                                 Some(tint),
                             );
@@ -2946,36 +2945,36 @@ fn spawn_ui_panel_nodes_depth_first(
                             img_node.flip_y = node.flip_y;
                             spawn_ui_element(
                                 frame,
-                                layout_node,
-                                node.is_interactive,
-                                &node.name,
+                                node,
+                                ref_w,
+                                ref_h,
                                 Some(img_node),
                                 None,
                             );
                         } else if *missing_texture {
                             spawn_ui_element(
                                 frame,
-                                layout_node,
-                                node.is_interactive,
-                                &node.name,
+                                node,
+                                ref_w,
+                                ref_h,
                                 None,
                                 Some(Color::srgba(color[0], color[1], color[2], (alpha * 0.14).max(0.04))),
                             );
                         } else if color[0] > 0.90 && color[1] > 0.90 && color[2] > 0.90 && rw > 48.0 && rh > 48.0 {
                             spawn_ui_element(
                                 frame,
-                                layout_node,
-                                node.is_interactive,
-                                &node.name,
+                                node,
+                                ref_w,
+                                ref_h,
                                 None,
                                 None,
                             );
                         } else {
                             spawn_ui_element(
                                 frame,
-                                layout_node,
-                                node.is_interactive,
-                                &node.name,
+                                node,
+                                ref_w,
+                                ref_h,
                                 None,
                                 Some(tint),
                             );
@@ -3006,7 +3005,11 @@ fn spawn_ui_panel_nodes_depth_first(
                             };
                             frame.spawn((
                                 Pickable::IGNORE,
-                                layout_node,
+                                ui_panel_layout(
+                                    node.canvas_render_rect.unwrap_or(node.canvas_rect),
+                                    [0.0, 0.0, ref_w, ref_h],
+                                ),
+                                ui_panel_artwork_transform(node),
                                 UiPanelScaledText {
                                     base_px: (*font_size).max(8.0),
                                 },
@@ -3026,9 +3029,9 @@ fn spawn_ui_panel_nodes_depth_first(
         } else if node.is_interactive {
             spawn_ui_element(
                 frame,
-                layout_node,
-                true,
-                &node.name,
+                node,
+                ref_w,
+                ref_h,
                 None,
                 Some(Color::srgba(0.2, 0.65, 0.9, 0.08)),
             );
@@ -3048,26 +3051,68 @@ fn spawn_ui_panel_nodes_depth_first(
     }
 }
 
+fn ui_panel_layout(rect: [f32; 4], parent_rect: [f32; 4]) -> Node {
+    let [x, y, w, h] = rect;
+    let [px, py, pw, ph] = parent_rect;
+    Node {
+        position_type: PositionType::Absolute,
+        left: Val::Percent(((x - px) / pw.max(1.0)) * 100.0),
+        top: Val::Percent(((y - py) / ph.max(1.0)) * 100.0),
+        width: Val::Percent((w / pw.max(1.0)) * 100.0),
+        height: Val::Percent((h / ph.max(1.0)) * 100.0),
+        overflow: Overflow::clip(),
+        justify_content: JustifyContent::Center,
+        align_items: AlignItems::Center,
+        ..default()
+    }
+}
+
+fn ui_panel_artwork_transform(node: &UiPanelNodeDto) -> UiTransform {
+    // Exported canvas rotation already includes ancestors. The viewer flattens descendants
+    // onto the frame, so apply it once to artwork rather than rotating logical containers.
+    UiTransform::from_rotation(Rot2::degrees(
+        node.canvas_rotation_z_deg.unwrap_or(node.rotation_z_deg),
+    ))
+}
+
 fn spawn_ui_element(
     frame: &mut ChildSpawnerCommands,
-    layout_node: Node,
-    is_interactive: bool,
-    name: &str,
+    node: &UiPanelNodeDto,
+    ref_w: f32,
+    ref_h: f32,
     image_node: Option<ImageNode>,
     bg_color: Option<Color>,
 ) {
-    let mut ec = frame.spawn((Name::new(name.to_owned()), layout_node));
-    if let Some(img) = image_node {
-        ec.insert(img);
+    let canvas = [0.0, 0.0, ref_w, ref_h];
+    let artwork_rect = node.canvas_render_rect.unwrap_or(node.canvas_rect);
+    let mut layout = ui_panel_layout(
+        if node.is_interactive { node.canvas_rect } else { artwork_rect },
+        canvas,
+    );
+    if node.is_interactive {
+        layout.overflow = Overflow::visible();
     }
-    if let Some(bg) = bg_color {
-        ec.insert(BackgroundColor(bg));
-    }
-    if is_interactive {
+    let mut ec = frame.spawn((Name::new(node.name.clone()), layout));
+    if node.is_interactive {
+        // Picking keeps the exported logical bounds. The child renders the original artwork
+        // dimensions around its center, avoiding a second stretch into the rotated AABB.
+        ec.with_children(|parent| {
+            let mut artwork = parent.spawn((
+                Pickable::IGNORE,
+                ui_panel_layout(artwork_rect, node.canvas_rect),
+                ui_panel_artwork_transform(node),
+            ));
+            if let Some(img) = image_node {
+                artwork.insert(img);
+            }
+            if let Some(bg) = bg_color {
+                artwork.insert(BackgroundColor(bg));
+            }
+        });
         ec.insert((
             Button,
             Hovered::default(),
-            UiPanelInteractiveLabel(name.to_owned()),
+            UiPanelInteractiveLabel(node.name.clone()),
             observe(
                 |activate: On<Activate>,
                  labels: Query<&UiPanelInteractiveLabel>,
@@ -3090,7 +3135,13 @@ fn spawn_ui_element(
             ),
         ));
     } else {
-        ec.insert(Pickable::IGNORE);
+        ec.insert((Pickable::IGNORE, ui_panel_artwork_transform(node)));
+        if let Some(img) = image_node {
+            ec.insert(img);
+        }
+        if let Some(bg) = bg_color {
+            ec.insert(BackgroundColor(bg));
+        }
     }
 }
 
@@ -3792,6 +3843,88 @@ fn update_hud_status_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn affine_panel_artwork_preserves_hit_bounds_and_flat_rotation() {
+        let node: UiPanelNodeDto = serde_json::from_str(r#"{
+            "name": "RotatedButton",
+            "active_in_hierarchy": true,
+            "canvas_rect": [40.0, 20.0, 20.0, 40.0],
+            "canvas_render_rect": [30.0, 30.0, 40.0, 20.0],
+            "canvas_rotation_z_deg": 90.0,
+            "rotation_z_deg": -90.0,
+            "is_interactive": true,
+            "graphic": {"kind": "image", "color": [0.0, 0.0, 0.0, 1.0]},
+            "children": [{
+                "name": "CounterRotatedArtwork",
+                "active_in_hierarchy": true,
+                "canvas_rect": [70.0, 20.0, 40.0, 20.0],
+                "canvas_render_rect": [70.0, 20.0, 40.0, 20.0],
+                "canvas_rotation_z_deg": 0.0,
+                "rotation_z_deg": -90.0,
+                "graphic": {"kind": "image", "color": [0.0, 0.0, 0.0, 1.0]}
+            }, {
+                "name": "RotatedText",
+                "active_in_hierarchy": true,
+                "canvas_rect": [120.0, 20.0, 20.0, 40.0],
+                "canvas_render_rect": [110.0, 30.0, 40.0, 20.0],
+                "canvas_rotation_z_deg": -90.0,
+                "graphic": {"kind": "text", "text": "Rotated label", "color": [1.0, 1.0, 1.0, 1.0], "font_size": 12.0}
+            }]
+        }"#).expect("affine panel fixture");
+        let mut world = World::new();
+        let frame = world.spawn(Node::default()).id();
+        world.commands().entity(frame).with_children(|parent| {
+            spawn_ui_panel_nodes_depth_first(
+                parent,
+                &node,
+                200.0,
+                100.0,
+                1.0,
+                &HashMap::new(),
+                &FontSource::sans_serif(),
+            );
+        });
+        world.flush();
+
+        let mut named = world.query::<(Entity, &Name)>();
+        let hitbox = named.iter(&world)
+            .find(|(_, name)| name.as_str() == "RotatedButton")
+            .map(|(entity, _)| entity).expect("logical hitbox");
+        let counter_rotated = named.iter(&world)
+            .find(|(_, name)| name.as_str() == "CounterRotatedArtwork")
+            .map(|(entity, _)| entity).expect("flat descendant artwork");
+        let bounds = world.get::<Node>(hitbox).expect("hitbox bounds");
+        assert_eq!(bounds.left, Val::Percent(20.0));
+        assert_eq!(bounds.top, Val::Percent(20.0));
+        assert_eq!(bounds.width, Val::Percent(10.0));
+        assert_eq!(bounds.height, Val::Percent(40.0));
+        assert_eq!(world.get::<UiTransform>(hitbox).expect("logical transform").rotation, Rot2::IDENTITY);
+
+        let artwork = world.get::<Children>(hitbox).expect("artwork child")[0];
+        let artwork_bounds = world.get::<Node>(artwork).expect("unrotated artwork box");
+        assert_eq!(artwork_bounds.left, Val::Percent(-50.0));
+        assert_eq!(artwork_bounds.top, Val::Percent(25.0));
+        assert_eq!(artwork_bounds.width, Val::Percent(200.0));
+        assert_eq!(artwork_bounds.height, Val::Percent(50.0));
+        assert_eq!(world.get::<UiTransform>(artwork).expect("artwork transform").rotation, Rot2::degrees(90.0));
+        assert_eq!(world.get::<ChildOf>(counter_rotated).expect("frame parent").parent(), frame);
+        assert_eq!(world.get::<UiTransform>(counter_rotated).expect("cumulative transform").rotation, Rot2::IDENTITY);
+
+        let mut texts = world.query::<(Entity, &Text)>();
+        let text = texts.iter(&world).find(|(_, text)| text.0 == "Rotated label")
+            .map(|(entity, _)| entity).expect("rotated text artwork");
+        let text_bounds = world.get::<Node>(text).expect("text artwork bounds");
+        assert_eq!(text_bounds.width, Val::Percent(20.0));
+        assert_eq!(text_bounds.height, Val::Percent(20.0));
+        assert_eq!(world.get::<UiTransform>(text).expect("text transform").rotation, Rot2::degrees(-90.0));
+
+        let legacy: UiPanelNodeDto = serde_json::from_str(
+            r#"{"name":"Legacy", "canvas_rect":[0.0,0.0,40.0,20.0], "rotation_z_deg":-90.0}"#,
+        ).expect("legacy panel fixture");
+        assert_eq!(legacy.canvas_render_rect, None);
+        assert_eq!(ui_panel_artwork_transform(&legacy).rotation, Rot2::degrees(-90.0));
+    }
 
     #[test]
     fn manifest_loads_and_referenced_assets_exist_on_disk() {

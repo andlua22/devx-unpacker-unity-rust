@@ -55,7 +55,20 @@ impl DecodedMaterial {
             "_DiffuseTex",
             "_Diffuse",
         ])
-        .or_else(|| self.textures.iter().find(|t| t.texture_path_id != 0))
+        .or_else(|| {
+            self.textures.iter().find(|t| {
+                let name = t.property_name.to_ascii_lowercase();
+                t.texture_path_id != 0
+                    && !name.contains("control")
+                    && !name.contains("normal")
+                    && !name.contains("bump")
+                    && !name.contains("mask")
+                    && !name.contains("gloss")
+                    && !name.contains("emission")
+                    && !name.contains("occlusion")
+                    && !name.starts_with("_splat")
+            })
+        })
     }
 
     /// Returns a tangent-space normal map slot if bound.
@@ -550,5 +563,23 @@ mod tests {
         };
         assert!(lit.has_active_emission());
         assert_eq!(lit.emissive_color(), Some([0.4, 0.8, 1.0]));
+    }
+
+    #[test]
+    fn data_and_splat_textures_are_never_guessed_as_albedo() {
+        let mut mat = DecodedMaterial {
+            name: "terrain".into(), shader_file_id: 0, shader_path_id: 0,
+            render_queue: 2100, valid_keywords: vec![], string_tags: vec![],
+            textures: ["_Control", "_Splat0", "_BumpMap", "_MaskMap", "_EmissionMap"]
+                .iter().enumerate().map(|(i, property)| MaterialTextureSlot {
+                    property_name: (*property).to_owned(), texture_file_id: 0,
+                    texture_path_id: i as i64 + 1, scale: [1.0; 2], offset: [0.0; 2],
+                }).collect(),
+            colors: vec![], floats: vec![], ints: vec![],
+        };
+        assert!(mat.albedo_slot().is_none());
+        mat.textures.push(MaterialTextureSlot { property_name: "_MainTex".into(),
+            texture_file_id: 0, texture_path_id: 99, scale: [1.0; 2], offset: [0.0; 2] });
+        assert_eq!(mat.albedo_slot().map(|slot| slot.texture_path_id), Some(99));
     }
 }

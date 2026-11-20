@@ -1,4 +1,4 @@
-//! LoadingScene transition screen (`BattleLoadingPanel` artwork + UDP Welcome gate) and
+//! LoadingScene transition screen (native BattleLoadingPanel + battle resource readiness) and
 //! Phase 3 InGame 100-player survival HUD (crosshair, hotbar, resources, and crafting menu).
 
 use bevy::ecs::system::SystemParam;
@@ -6,21 +6,32 @@ use bevy::picking::Pickable;
 use bevy::picking::hover::Hovered;
 use bevy::prelude::*;
 use bevy::text::{FontSize, FontSource};
-use bevy::ui::ScrollPosition;
 use bevy::ui_widgets::{Activate, Button, observe};
+use std::collections::BTreeMap;
 
-use crate::config::{BaseSaveData, GameConfigs, LocalizationDb, PlayerProfileSave, PlayerSessionPrefs};
-use crate::net::protocol::{MAX_PLAYERS, OP_CONSUME_BANDAGE, OP_CRAFT_RECIPE};
-use crate::net::transport::{ClientLinkPhase, NetClientState, NetServerHandle};
+use crate::config::{
+    DrawingCfgEntry, GameConfigs, LocalizationDb, PlayerProfileSave, PlayerSessionPrefs,
+    resolve_assets_root,
+};
+use crate::crafting::{CraftCatalog, CraftContext};
+use crate::net::protocol::MAX_PLAYERS;
+use crate::net::transport::{NetClientState, NetServerHandle};
 use crate::states::{AppState, InGameRoot, LoadingSceneUiRoot};
-use crate::survival::{CRAFT_RECIPES, HotbarItem, SurvivalSessionState};
+use crate::survival::{HotbarItem, SurvivalSessionState};
 use crate::ui::panel_loader::{
     BoundUiPanel, UiPaletteButton, UiRetainedOptions, apply_panel_default_view_rules,
-    compute_panel_fit_scale, load_ui_panel_doc, spawn_chrome_backdrop,
-    spawn_fullscreen_backdrop, spawn_retained_panel_stage, strip_rich_text_tags,
+    compute_panel_canvas_metrics, compute_panel_fit_scale, load_ui_panel_doc,
+    spawn_chrome_backdrop, spawn_fullscreen_backdrop, spawn_retained_panel_stage,
+    strip_rich_text_tags,
 };
-use crate::ui::widgets::UiScrollArea;
+use crate::ui::widgets::UiFilledBar;
 use crate::world_physics::{BuildPieceKind, EnemyKind};
+
+#[path = "native_crafting.rs"]
+mod native_crafting;
+use native_crafting::{
+    spawn_crafting_panel, update_crafting_panel, update_crafting_quantity_input,
+};
 
 #[derive(Clone, Copy)]
 struct HudTheme {
@@ -72,6 +83,12 @@ struct HealthBarFill;
 #[derive(Component)]
 struct CraftOverlayRoot;
 
+#[derive(Resource, Default)]
+struct CraftUiCatalog {
+    catalog: CraftCatalog,
+    icons: BTreeMap<i32, String>,
+}
+
 #[derive(Component, Clone, Copy)]
 struct HotbarSlot(usize);
 
@@ -97,8 +114,15 @@ enum InGameHudAction {
     SelectTurretBuild,
     SelectGeneratorBuild,
     SaveBaseNow,
-    CraftRecipe(u8),
-    UseBandage,
+    SelectCraftRecipe(i32),
+    AdjustCraftQuantity(i32),
+    MaxCraftQuantity,
+    SelectCraftPrimary(i32),
+    SelectCraftSecondary(i32),
+    SelectCraftQueue(usize),
+    CancelCraftQueue,
+    LearnCraftDrawing,
+    SubmitCraftRecipe,
 }
 
 /// Registers UI systems for `LoadingScene` and `InGame` HUD overlays.
@@ -107,10 +131,13 @@ pub struct InGameHudPlugin;
 impl Plugin for InGameHudPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LoadingSceneTimer>()
+            .init_resource::<CraftUiCatalog>()
             .add_systems(OnEnter(AppState::LoadingScene), spawn_loading_scene_ui)
             .add_systems(
                 Update,
-                update_loading_scene_ui.run_if(in_state(AppState::LoadingScene)),
+                update_loading_scene_ui
+                    .after(crate::battle::BattleLoadingSet::Readiness)
+                    .run_if(in_state(AppState::LoadingScene)),
             )
             .add_systems(OnEnter(AppState::InGame), spawn_ingame_hud)
             .add_systems(
@@ -119,6 +146,8 @@ impl Plugin for InGameHudPlugin {
                     update_ingame_hud_text,
                     update_ingame_survival_widgets,
                     update_battle_minimap_blips,
+                    update_crafting_quantity_input,
+                    update_crafting_panel,
                 )
                     .run_if(in_state(AppState::InGame)),
             );
@@ -141,8 +170,14 @@ fn spawn_loading_scene_ui(
         .next()
         .map(|w| Vec2::new(w.width(), w.height()))
         .unwrap_or(Vec2::new(1280.0, 720.0));
-    let ref_w = doc.as_ref().map(|d| d.reference_width.max(64.0)).unwrap_or(1920.0);
-    let ref_h = doc.as_ref().map(|d| d.reference_height.max(64.0)).unwrap_or(1080.0);
+    let ref_w = doc
+        .as_ref()
+        .map(|d| d.reference_width.max(64.0))
+        .unwrap_or(1920.0);
+    let ref_h = doc
+        .as_ref()
+        .map(|d| d.reference_height.max(64.0))
+        .unwrap_or(1080.0);
     let fit_scale = compute_panel_fit_scale(ref_w, ref_h, win_size, true);
 
     let backdrop = crate::ui::loading_panel::select_load_panel_backdrop(&configs, true);
@@ -162,10 +197,17 @@ fn spawn_loading_scene_ui(
             },
         ))
         .with_children(|outer| {
-            spawn_fullscreen_backdrop(outer, &asset_server, None, Color::srgb(0.03, 0.05, 0.08), 0.0);
+            spawn_fullscreen_backdrop(
+                outer,
+                &asset_server,
+                None,
+                Color::srgb(0.03, 0.05, 0.08),
+                0.0,
+            );
             if let Some(ref panel_doc) = doc {
                 let mut opts = UiRetainedOptions {
                     fullscreen: true,
+                    viewport_size: Some(win_size),
                     fit_scale,
                     localize_text: true,
                     preview_mode: false,
@@ -208,19 +250,45 @@ fn update_loading_scene_ui(
     mut timer: ResMut<LoadingSceneTimer>,
     configs: Res<GameConfigs>,
     l10n: Res<LocalizationDb>,
-    client: Res<NetClientState>,
+    mut client: ResMut<NetClientState>,
+    load: Res<crate::battle::BattleLoadState>,
+    capture_hold: Option<Res<crate::ui::loading_panel::BattleLoadingCaptureHold>>,
     mut next_state: ResMut<NextState<AppState>>,
     bound_q: Query<&BoundUiPanel, With<LoadingSceneUiRoot>>,
     mut text_q: Query<&mut Text>,
+    mut nodes: Query<&mut Node>,
+    mut bars: Query<&mut UiFilledBar>,
 ) {
     timer.0 += time.delta_secs();
 
     if keys.just_pressed(KeyCode::Escape) {
-        next_state.set_if_different(AppState::LoginLobby);
+        client.disconnect();
+        next_state.set_if_different(AppState::MainLobby);
         return;
     }
 
-    if !configs.battle_loading_tips.is_empty()
+    if let Ok(bound) = bound_q.single() {
+        if let Some(fill) = bound.first("Fill") {
+            BoundUiPanel::set_slider_fill(fill, load.fraction, &mut nodes, &mut bars);
+        }
+        if let Some(percent) = bound.game_object_slot(5) {
+            bound.set_entity_text(
+                percent,
+                &format!("{:.2}%", load.fraction.clamp(0.0, 1.0) * 100.0),
+                &mut text_q,
+            );
+        }
+        if let Some(error) = &load.error {
+            bound.set_text(
+                "txt_tips",
+                &format!("{error}\nEsc: return to lobby"),
+                &mut text_q,
+            );
+        }
+    }
+
+    if load.error.is_none()
+        && !configs.battle_loading_tips.is_empty()
         && let Ok(bound) = bound_q.single()
     {
         let weighted: Vec<&str> = configs
@@ -239,9 +307,8 @@ fn update_loading_scene_ui(
         bound.set_text("txt_tips", &tip, &mut text_q);
     }
 
-    if client.phase == ClientLinkPhase::Connected
-        && client.local_player_state().is_some()
-        && timer.0 >= 0.25
+    if !capture_hold.as_deref().is_some_and(|hold| hold.0)
+        && load.phase == crate::battle::BattleLoadPhase::Ready
     {
         next_state.set_if_different(AppState::InGame);
     }
@@ -251,9 +318,42 @@ fn spawn_ingame_hud(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     profile: Res<PlayerProfileSave>,
+    configs: Res<GameConfigs>,
+    l10n: Res<LocalizationDb>,
+    client: Res<NetClientState>,
+    windows: Query<&Window>,
+    mut survival: ResMut<SurvivalSessionState>,
 ) {
     let font_source = FontSource::sans_serif();
     let theme = HudTheme::from_profile(&profile);
+    let catalog = CraftCatalog::from_configs(&configs);
+    let visible = catalog.visible_drawings(&survival.craft_context());
+    if !visible
+        .iter()
+        .any(|drawing| Some(drawing.id) == survival.craft_selected_drawing)
+    {
+        survival.craft_selected_drawing = visible
+            .iter()
+            .find(|drawing| drawing.is_default)
+            .map(|drawing| drawing.id);
+    }
+    survival.craft_quantity = survival
+        .craft_selected_drawing
+        .and_then(|id| catalog.drawing(id))
+        .map_or(0, |drawing| {
+            survival
+                .craft_quantity
+                .clamp(0, maximum_craft_quantity(drawing, &client.inventory))
+        });
+    let assets_root = resolve_assets_root();
+    let icons: BTreeMap<_, _> = catalog
+        .items
+        .values()
+        .filter_map(|item| {
+            let path = configs.starter_icon_asset_path(&item.icon);
+            assets_root.join(&path).is_file().then_some((item.id, path))
+        })
+        .collect();
     commands
         .spawn((
             InGameRoot,
@@ -272,8 +372,23 @@ fn spawn_ingame_hud(
         .with_children(|root| {
             spawn_top_bar(root, &asset_server, &font_source, theme);
             spawn_center_hud_and_crafting(root, &asset_server, &font_source, theme);
+            let window_size = windows
+                .iter()
+                .next()
+                .map_or(Vec2::new(1920.0, 1080.0), |window| {
+                    Vec2::new(window.width(), window.height())
+                });
+            spawn_crafting_panel(
+                root,
+                &asset_server,
+                &font_source,
+                &catalog,
+                &l10n,
+                window_size,
+            );
             spawn_bottom_hud(root, &asset_server, &font_source, theme);
         });
+    commands.insert_resource(CraftUiCatalog { catalog, icons });
 }
 
 fn spawn_top_bar(
@@ -472,7 +587,9 @@ fn spawn_top_bar(
                         // Local player heading marker centered in radar
                         map.spawn((
                             Pickable::IGNORE,
-                            ImageNode::new(asset_server.load("ui/1BattlePanel_map_xiaojianjiao.png")),
+                            ImageNode::new(
+                                asset_server.load("ui/1BattlePanel_map_xiaojianjiao.png"),
+                            ),
                             Node {
                                 position_type: PositionType::Absolute,
                                 left: Val::Px(MINIMAP_SIZE_PX * 0.5 - 7.0),
@@ -536,7 +653,9 @@ fn spawn_center_hud_and_crafting(
                 pill.spawn((
                     CrosshairPromptText,
                     Pickable::IGNORE,
-                    Text::new("LMB: Shoot / Gather | [4-0/T/G] Build | [F] Board/Use | [U] Upgrade"),
+                    Text::new(
+                        "LMB: Shoot / Gather | [4-0/T/G] Build | [F] Board/Use | [U] Upgrade",
+                    ),
                     TextFont {
                         font: font_source.clone(),
                         font_size: FontSize::Px(12.0 + theme.font_delta),
@@ -544,79 +663,6 @@ fn spawn_center_hud_and_crafting(
                     },
                     TextColor(Color::srgb(0.92, 0.96, 0.99)),
                 ));
-            });
-
-        // `[Tab]` Interactive Crafting & Survival Supply Modal backed by BagAndBuildPanel art
-        center
-            .spawn((
-                CraftOverlayRoot,
-                UiScrollArea { speed_px: 1.0 },
-                Hovered::default(),
-                ScrollPosition::default(),
-                Node {
-                    display: Display::None,
-                    width: Val::Px(470.0),
-                    max_height: Val::Percent(64.0),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(8.0),
-                    padding: UiRect::all(Val::Px(14.0)),
-                    border: UiRect::all(Val::Px(1.5)),
-                    border_radius: BorderRadius::all(Val::Px(8.0)),
-                    overflow: Overflow::scroll_y(),
-                    ..default()
-                },
-                BackgroundColor(Color::srgba(0.06, 0.09, 0.15, 0.95)),
-                BorderColor::all(Color::srgb(0.42, 0.68, 0.94)),
-            ))
-            .with_children(|panel| {
-                spawn_chrome_backdrop(
-                    panel,
-                    asset_server,
-                    "ui/BagAndBuildPanel_bg_1.png",
-                    Color::srgba(0.85, 0.92, 1.0, 0.25),
-                );
-                panel
-                    .spawn(Node {
-                        width: Val::Percent(100.0),
-                        flex_direction: FlexDirection::Row,
-                        justify_content: JustifyContent::SpaceBetween,
-                        align_items: AlignItems::Center,
-                        ..default()
-                    })
-                    .with_children(|hdr| {
-                        hdr.spawn((
-                            Text::new("Field Crafting & Supplies"),
-                            TextFont {
-                                font: font_source.clone(),
-                                font_size: FontSize::Px(16.0),
-                                ..default()
-                            },
-                            TextColor(Color::WHITE),
-                        ));
-                        spawn_ingame_btn(
-                            hdr,
-                            "Close [Tab]",
-                            InGameHudAction::ToggleCraftMenu,
-                            font_source,
-                        );
-                    });
-
-                for recipe in CRAFT_RECIPES {
-                    let label = format!("{}  ({})", recipe.title, recipe.cost_text);
-                    spawn_ingame_btn(
-                        panel,
-                        &label,
-                        InGameHudAction::CraftRecipe(recipe.id),
-                        font_source,
-                    );
-                }
-
-                spawn_ingame_btn(
-                    panel,
-                    "Use Bandage (+35 HP) [H]",
-                    InGameHudAction::UseBandage,
-                    font_source,
-                );
             });
     });
 }
@@ -710,7 +756,9 @@ fn spawn_bottom_hud(
                 vitals.spawn((
                     SurvivalStatsText,
                     Pickable::IGNORE,
-                    Text::new("HP 100 | Ammo 60 | Bandages 2\nWood 120 | Stone 60 | Iron 25 | Fiber 30"),
+                    Text::new(
+                        "HP 100 | Ammo 60 | Bandages 2\nWood 120 | Stone 60 | Iron 25 | Cloth 30",
+                    ),
                     TextFont {
                         font: font_source.clone(),
                         font_size: FontSize::Px(11.5 + theme.font_delta),
@@ -879,7 +927,13 @@ fn spawn_bottom_hud(
                 });
             });
 
-        bottom.spawn((Pickable::IGNORE, Node { width: Val::Px(20.0), ..default() }));
+        bottom.spawn((
+            Pickable::IGNORE,
+            Node {
+                width: Val::Px(20.0),
+                ..default()
+            },
+        ));
     });
 }
 
@@ -888,7 +942,7 @@ fn spawn_ingame_btn(
     label: &str,
     action: InGameHudAction,
     font: &FontSource,
-) {
+) -> Entity {
     let palette = UiPaletteButton::default();
     parent
         .spawn((
@@ -916,7 +970,8 @@ fn spawn_ingame_btn(
                 },
                 TextColor(Color::WHITE),
             ));
-        });
+        })
+        .id()
 }
 
 #[derive(SystemParam)]
@@ -925,6 +980,8 @@ struct HudActionCtx<'w> {
     client: ResMut<'w, NetClientState>,
     survival: ResMut<'w, SurvivalSessionState>,
     next_state: ResMut<'w, NextState<AppState>>,
+    configs: Res<'w, GameConfigs>,
+    craft_catalog: Res<'w, CraftUiCatalog>,
 }
 
 fn on_ingame_hud_action(
@@ -974,22 +1031,135 @@ fn on_ingame_hud_action(
                 let owner = ctx.client.local_player_id.unwrap_or(1);
                 let save = srv.world.export_saved_base(owner);
                 ctx.survival.status_banner =
-                    match save.save_atomic(&BaseSaveData::resolve_save_path()) {
+                    match save.save_atomic(&srv.world.saved_base_path(owner)) {
                         Ok(()) => format!("Saved base ({} structures)", save.structures.len()),
                         Err(e) => format!("Base save failed: {e}"),
                     };
                 ctx.survival.status_banner_secs = 3.5;
             }
         }
-        InGameHudAction::CraftRecipe(recipe_id) => {
-            ctx.client
-                .send_world_op(OP_CRAFT_RECIPE, recipe_id as u32, 0, 0, Vec3::ZERO);
+        InGameHudAction::SelectCraftRecipe(drawing_id) => {
+            if let Some(drawing) = ctx.craft_catalog.catalog.drawing(drawing_id) {
+                ctx.survival.craft_selected_drawing = Some(drawing_id);
+                ctx.survival.craft_selected_queue = None;
+                ctx.survival.craft_quantity =
+                    maximum_craft_quantity(drawing, &ctx.client.inventory).min(1);
+            }
         }
-        InGameHudAction::UseBandage => {
-            ctx.client
-                .send_world_op(OP_CONSUME_BANDAGE, 0, 0, 0, Vec3::ZERO);
+        InGameHudAction::AdjustCraftQuantity(delta) => {
+            if let Some(drawing) = ctx
+                .survival
+                .craft_selected_drawing
+                .and_then(|id| ctx.craft_catalog.catalog.drawing(id))
+            {
+                let max = maximum_craft_quantity(drawing, &ctx.client.inventory);
+                ctx.survival.craft_quantity = ctx
+                    .survival
+                    .craft_quantity
+                    .saturating_add(delta)
+                    .clamp(0, max);
+            }
+        }
+        InGameHudAction::MaxCraftQuantity => {
+            if let Some(drawing) = ctx
+                .survival
+                .craft_selected_drawing
+                .and_then(|id| ctx.craft_catalog.catalog.drawing(id))
+            {
+                ctx.survival.craft_quantity =
+                    maximum_craft_quantity(drawing, &ctx.client.inventory);
+            }
+        }
+        InGameHudAction::SelectCraftPrimary(tab) => {
+            ctx.survival.craft_primary_tab = tab;
+            ctx.survival.craft_secondary_tab = native_crafting::secondary_tabs(tab)
+                .first()
+                .copied()
+                .unwrap_or(tab);
+            native_crafting::reset_category_selection(
+                &ctx.craft_catalog.catalog,
+                &mut ctx.survival,
+                &ctx.client.inventory,
+            );
+        }
+        InGameHudAction::SelectCraftSecondary(tab) => {
+            ctx.survival.craft_secondary_tab = tab;
+            native_crafting::reset_category_selection(
+                &ctx.craft_catalog.catalog,
+                &mut ctx.survival,
+                &ctx.client.inventory,
+            );
+        }
+        InGameHudAction::SelectCraftQueue(index) => {
+            if let Some(entry) = ctx.client.craft_queue.get(index) {
+                ctx.survival.craft_selected_queue = Some(index);
+                ctx.survival.craft_selected_drawing = Some(entry.drawing_id);
+            }
+        }
+        InGameHudAction::CancelCraftQueue => {
+            ctx.survival.status_banner = "This production cannot be cancelled yet".to_owned();
+            ctx.survival.status_banner_secs = 3.5;
+        }
+        InGameHudAction::LearnCraftDrawing => {
+            ctx.survival.status_banner =
+                "A drawing in your bag is required to learn this recipe".to_owned();
+            ctx.survival.status_banner_secs = 3.5;
+        }
+        InGameHudAction::SubmitCraftRecipe => {
+            let result = prepare_craft_request(&ctx.configs, &ctx.survival, &ctx.client.inventory)
+                .and_then(|(drawing_id, create_num, facility_id)| {
+                    ctx.client
+                        .send_craft_request(drawing_id, create_num, facility_id)
+                        .map(|_| ())
+                });
+            if let Err(error) = result {
+                ctx.survival.status_banner = error;
+                ctx.survival.status_banner_secs = 3.5;
+            }
         }
     }
+}
+
+/// Product batches affordable from current native ingredient quantities.
+fn maximum_craft_quantity(drawing: &DrawingCfgEntry, inventory: &BTreeMap<i32, i32>) -> i32 {
+    let mut required = BTreeMap::<i32, i64>::new();
+    for material in &drawing.material {
+        if material.num <= 0 {
+            return 0;
+        }
+        *required.entry(material.item_id).or_default() += i64::from(material.num);
+    }
+    required
+        .into_iter()
+        .fold(drawing.once_max_create.max(0), |max, (item_id, num)| {
+            let stock = i64::from(inventory.get(&item_id).copied().unwrap_or(0).max(0));
+            max.min((stock / num).min(i64::from(i32::MAX)) as i32)
+        })
+}
+
+/// Keeps the selected native identity and signed quantity intact for the transport.
+/// Workbench proximity and final validation belong to the authoritative server.
+pub fn prepare_craft_request(
+    configs: &GameConfigs,
+    survival: &SurvivalSessionState,
+    inventory: &BTreeMap<i32, i32>,
+) -> Result<(i32, i32, i64), String> {
+    let drawing_id = survival.craft_selected_drawing.ok_or("Select a recipe")?;
+    let drawing = configs
+        .drawing_cfgs
+        .iter()
+        .find(|drawing| drawing.id == drawing_id)
+        .ok_or("Unknown recipe")?;
+    if survival.craft_quantity <= 0 || survival.craft_quantity > drawing.once_max_create {
+        return Err("Invalid production quantity".to_owned());
+    }
+    if survival.craft_context().is_locked(drawing) {
+        return Err("Recipe has not been learned".to_owned());
+    }
+    if survival.craft_quantity > maximum_craft_quantity(drawing, inventory) {
+        return Err("Insufficient materials".to_owned());
+    }
+    Ok((drawing_id, survival.craft_quantity, -1))
 }
 
 fn update_ingame_hud_text(
@@ -1090,7 +1260,12 @@ fn update_ingame_survival_widgets(
         ),
     >,
     mut hotbar_q: Query<
-        (&HotbarSlot, &Hovered, &mut BackgroundColor, &mut BorderColor),
+        (
+            &HotbarSlot,
+            &Hovered,
+            &mut BackgroundColor,
+            &mut BorderColor,
+        ),
         (
             Without<HealthBarFill>,
             Without<TurretQuickSlot>,
@@ -1149,7 +1324,7 @@ fn update_ingame_survival_widgets(
             String::new()
         };
         **stats = format!(
-            "HP {}/100 | Ammo {} | Bandages {} | {grid_line}\nWood {} | Stone {} | Iron {} | Fiber {}{veh_line}",
+            "HP {}/100 | Ammo {} | Bandages {} | {grid_line}\nWood {} | Stone {} | Iron {} | Cloth {}{veh_line}",
             client.hp,
             client.ammo,
             client.bandages,
@@ -1282,5 +1457,173 @@ fn update_battle_minimap_blips(
         } else {
             node.display = Display::None;
         }
+    }
+}
+
+#[cfg(test)]
+mod crafting_tests {
+    use super::*;
+    use crate::config::DecodedOcFile;
+    use std::sync::OnceLock;
+
+    fn configs() -> GameConfigs {
+        static DRAWINGS: OnceLock<Vec<DrawingCfgEntry>> = OnceLock::new();
+        GameConfigs {
+            drawing_cfgs: DRAWINGS
+                .get_or_init(|| {
+                    let decoded: DecodedOcFile<DrawingCfgEntry> = serde_json::from_str(
+                        &std::fs::read_to_string(
+                            resolve_assets_root().join("config/cfg.DrawingCfg.json"),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    decoded.records
+                })
+                .clone(),
+            ..default()
+        }
+    }
+
+    #[test]
+    fn selected_native_recipe_and_large_quantity_survive_request_preparation() {
+        let configs = configs();
+        let mut survival = SurvivalSessionState {
+            craft_selected_drawing: Some(57100),
+            craft_quantity: 999,
+            ..default()
+        };
+        let stock = BTreeMap::from([(50003, 4995)]);
+        assert_eq!(
+            prepare_craft_request(&configs, &survival, &stock),
+            Ok((57100, 999, -1))
+        );
+        survival.craft_selected_drawing = Some(57021);
+        survival.craft_quantity = 3;
+        assert_eq!(
+            prepare_craft_request(
+                &configs,
+                &survival,
+                &BTreeMap::from([(50008, 30), (50017, 15)])
+            ),
+            Ok((57021, 3, -1))
+        );
+        survival.craft_selected_drawing = Some(7);
+        assert!(prepare_craft_request(&configs, &survival, &stock).is_err());
+        survival.craft_selected_drawing = Some(57100);
+        for quantity in [-1, 0, 1000] {
+            survival.craft_quantity = quantity;
+            assert!(prepare_craft_request(&configs, &survival, &stock).is_err());
+        }
+    }
+
+    #[test]
+    fn quantities_use_native_material_ids_and_combined_ingredient_stock() {
+        let configs = configs();
+        let mut drawing = configs
+            .drawing_cfgs
+            .iter()
+            .find(|row| row.id == 57100)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            maximum_craft_quantity(&drawing, &BTreeMap::from([(50003, 10)])),
+            2
+        );
+        assert_eq!(
+            maximum_craft_quantity(&drawing, &BTreeMap::from([(50001, 100)])),
+            0
+        );
+        drawing.material.push(crate::config::DrawingMaterialEntry {
+            item_id: 50003,
+            num: 2,
+        });
+        assert_eq!(
+            maximum_craft_quantity(&drawing, &BTreeMap::from([(50003, 10)])),
+            1
+        );
+        let survival = SurvivalSessionState {
+            craft_quantity: 3,
+            ..default()
+        };
+        assert!(
+            prepare_craft_request(&configs, &survival, &BTreeMap::from([(50003, 10)])).is_err()
+        );
+    }
+
+    #[test]
+    fn recipe_selection_and_quantity_controls_apply_before_submission() {
+        let configs = configs();
+        let mut app = App::new();
+        app.insert_resource(CraftUiCatalog {
+            catalog: CraftCatalog::from_configs(&configs),
+            icons: BTreeMap::new(),
+        })
+        .insert_resource(configs)
+        .init_resource::<NetClientState>()
+        .init_resource::<SurvivalSessionState>()
+        .init_resource::<NextState<AppState>>();
+        app.world_mut()
+            .resource_mut::<NetClientState>()
+            .inventory
+            .insert(50003, 10);
+        let select = app
+            .world_mut()
+            .spawn((
+                InGameHudAction::SelectCraftRecipe(57100),
+                observe(on_ingame_hud_action),
+            ))
+            .id();
+        let plus = app
+            .world_mut()
+            .spawn((
+                InGameHudAction::AdjustCraftQuantity(1),
+                observe(on_ingame_hud_action),
+            ))
+            .id();
+        let minus = app
+            .world_mut()
+            .spawn((
+                InGameHudAction::AdjustCraftQuantity(-1),
+                observe(on_ingame_hud_action),
+            ))
+            .id();
+        let max = app
+            .world_mut()
+            .spawn((
+                InGameHudAction::MaxCraftQuantity,
+                observe(on_ingame_hud_action),
+            ))
+            .id();
+        app.world_mut().trigger(Activate { entity: select });
+        app.world_mut().trigger(Activate { entity: plus });
+        app.world_mut().trigger(Activate { entity: plus });
+        assert_eq!(
+            app.world()
+                .resource::<SurvivalSessionState>()
+                .craft_quantity,
+            2
+        );
+        app.world_mut().trigger(Activate { entity: minus });
+        assert_eq!(
+            app.world()
+                .resource::<SurvivalSessionState>()
+                .craft_quantity,
+            1
+        );
+        app.world_mut().trigger(Activate { entity: max });
+        assert_eq!(
+            app.world()
+                .resource::<SurvivalSessionState>()
+                .craft_quantity,
+            2
+        );
+        let survival = app.world().resource::<SurvivalSessionState>();
+        let configs = app.world().resource::<GameConfigs>();
+        let client = app.world().resource::<NetClientState>();
+        assert_eq!(
+            prepare_craft_request(configs, survival, &client.inventory),
+            Ok((57100, 2, -1))
+        );
     }
 }

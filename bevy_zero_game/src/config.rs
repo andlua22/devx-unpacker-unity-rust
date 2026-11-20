@@ -200,6 +200,42 @@ pub struct ServerListData {
     pub regions: Vec<RegionEntry>,
 }
 
+/// Native WarChoice mode metadata; the client selects visibility and order from this table.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ZhanJuCfgEntry {
+    pub id: u8,
+    pub name: String,
+    pub desc: String,
+    pub need_show: bool,
+    pub show_in_competition_selection_panel: bool,
+    #[serde(rename = "sortID")]
+    pub sort_id: i32,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ZhanjuRegionCfgEntry {
+    pub id: i32,
+    #[serde(rename = "nameCN")]
+    pub name_cn: String,
+    #[serde(rename = "nameEN")]
+    pub name_en: String,
+    pub oversea: bool,
+    #[serde(rename = "isHeroServer")]
+    pub is_hero_server: bool,
+    #[serde(rename = "type")]
+    pub region_type: i32,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BattleMapCfgEntry {
+    pub id: i32,
+    pub name: String,
+    pub battle_ab_name: String,
+    pub mditu_scene_name: String,
+}
+
 /// Row from `cfg.MultiLanguageIndexCfg.json`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -347,6 +383,8 @@ pub struct GunCfgEntry {
     pub sound_setting_path: String,
     #[serde(default)]
     pub show_in_store: bool,
+    #[serde(default)]
+    pub main_panel_aim: String,
 }
 
 /// Cosmetic fashion entry from `cfg.RoleFashionCfg.json`.
@@ -424,7 +462,7 @@ pub struct MultiLanguageNameEntry {
 
 /// Sparse projection of `cfg.ItemCfg.json` used to enrich weapons and inventory items.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemCfgEntry {
     pub id: i32,
@@ -440,6 +478,71 @@ pub struct ItemCfgEntry {
     pub quality: i32,
     #[serde(rename = "type", default)]
     pub item_type: i32,
+    #[serde(default)]
+    pub child_type: i32,
+    #[serde(default)]
+    pub is_pile_able: bool,
+    #[serde(default)]
+    pub max_pile_num: i32,
+    #[serde(default)]
+    pub can_use: bool,
+    #[serde(default)]
+    pub use_time: f32,
+    #[serde(default)]
+    pub extras: Vec<f32>,
+    #[serde(default)]
+    pub extrasstring: Vec<String>,
+    #[serde(default)]
+    pub durability: i32,
+}
+
+/// Native ingredient IDs and per-batch quantities in `cfg.DrawingCfg`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DrawingMaterialEntry {
+    pub item_id: i32,
+    pub num: i32,
+}
+
+/// Complete decoded general-production row; the APK uses signed 32-bit IDs/counts.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DrawingCfgEntry {
+    pub id: i32,
+    pub name: String,
+    pub big_type: i32,
+    pub small_type: i32,
+    pub is_normal: bool,
+    pub is_show_locked: bool,
+    pub is_default: bool,
+    pub is_civi_normal: bool,
+    pub is_civi_show_locked: bool,
+    pub is_civi_default: bool,
+    pub is_nostalgia: bool,
+    pub is_nostalgia_show_locked: bool,
+    pub is_nostalgia_default: bool,
+    pub is_rare: bool,
+    pub level_limit: i32,
+    pub need_workbench: i32,
+    pub need_workbench_level: i32,
+    pub need_civilized_workbench: i32,
+    pub need_civilized_workbench_level: i32,
+    pub need_time: i32,
+    pub material: Vec<DrawingMaterialEntry>,
+    pub target_item_id: i32,
+    pub once_max_create: i32,
+    pub order: i32,
+    pub base_number: i32,
+    pub product_num: i32,
+    pub is_talent: bool,
+    pub infor_panel_type: i32,
+    pub battle_type_limit: i32,
+    pub need_tool_box_level: i32,
+    pub costom_need_show: bool,
+    pub is_fire_power_normal: bool,
+    pub is_fire_power_show_locked: bool,
+    pub is_fire_power_default: bool,
 }
 
 /// Base vehicle row from `cfg.VehicleCfg.json`.
@@ -617,14 +720,6 @@ impl KeybindProfile {
         }
     }
 
-    pub fn preset_label(preset_idx: u8) -> &'static str {
-        match preset_idx % 3 {
-            1 => "Compact Action (E/Q/V/C)",
-            2 => "Alt Right/Left (O/P/K/I)",
-            _ => "Standard WASD (F/R/U/Tab)",
-        }
-    }
-
     pub fn keycode(name: &str) -> bevy::prelude::KeyCode {
         KEY_LUT
             .iter()
@@ -682,6 +777,9 @@ pub struct BaseSaveData {
     pub bandages: u8,
     pub generator_fuel: u16,
     pub structures: Vec<SavedStructureEntry>,
+    pub owner_key: Option<LocalRoleKey>,
+    pub inventory: Option<crate::crafting::ItemInventory>,
+    pub craft_queue: crate::crafting::CraftQueue,
 }
 
 impl Default for BaseSaveData {
@@ -696,11 +794,28 @@ impl Default for BaseSaveData {
             bandages: 2,
             generator_fuel: 400,
             structures: Vec::new(),
+            owner_key: None,
+            inventory: None,
+            craft_queue: crate::crafting::CraftQueue::default(),
         }
     }
 }
 
 impl BaseSaveData {
+    /// Local replacement storage uses the same account/server identity as role snapshots.
+    pub fn resolve_role_save_path(account: &str, server_id: u32) -> PathBuf {
+        // Fixed FNV-1a filename; the embedded full owner key is also checked before overwriting.
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in account.as_bytes() {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        }
+        Self::resolve_save_path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("bases")
+            .join(server_id.to_string())
+            .join(format!("{hash:016x}.json"))
+    }
     /// Returns `~/.local/share/bevy_zero_game/base_save.json` (or `XDG_DATA_HOME` equivalent).
     pub fn resolve_save_path() -> PathBuf {
         PlayerProfileSave::resolve_save_path()
@@ -712,11 +827,21 @@ impl BaseSaveData {
     /// Loads saved base snapshot from disk if present and valid.
     pub fn load_from_disk(path: &Path) -> Option<Self> {
         let raw = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str::<Self>(&raw).ok()
+        let data = serde_json::from_str::<Self>(&raw).ok()?;
+        (data.version == 1 || data.version == 2).then_some(data)
     }
 
     /// Atomically writes `base_save.json` via temporary sibling + rename.
     pub fn save_atomic(&self, path: &Path) -> Result<(), String> {
+        if path.exists() {
+            let raw = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+            let previous: Self = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+            if !(1..=2).contains(&previous.version) || previous.owner_key != self.owner_key {
+                return Err(
+                    "Existing base belongs to another owner or unsupported save version".to_owned(),
+                );
+            }
+        }
         atomic_write_json(path, self)
     }
 }
@@ -726,13 +851,11 @@ fn atomic_write_json<T: Serialize>(path: &Path, val: &T) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create `{}`: {e}", parent.display()))?;
     }
-    let body = serde_json::to_string_pretty(val)
-        .map_err(|e| format!("failed to serialize JSON: {e}"))?;
+    let body =
+        serde_json::to_string_pretty(val).map_err(|e| format!("failed to serialize JSON: {e}"))?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body)
-        .map_err(|e| format!("failed to write `{}`: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .map_err(|e| format!("failed to commit `{}`: {e}", path.display()))
+    std::fs::write(&tmp, body).map_err(|e| format!("failed to write `{}`: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("failed to commit `{}`: {e}", path.display()))
 }
 
 /// Resolved armor/weapon catalog entry joining `manifest.props` with APK `.oc` metadata.
@@ -849,12 +972,32 @@ struct SceneCellFile {
     cells: Vec<SceneCellEntry>,
 }
 
-/// Local offline profile, loadout, customization, and `SettingMgr`-aligned preferences
-/// persisted cleanly as JSON on disk.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Resource)]
-#[serde(default)]
-pub struct PlayerProfileSave {
+/// Stable local replacement keys. Original server-side role ownership remains external.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalRoleKey {
     pub account_name: String,
+    pub server_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LocalAccountRoleSave {
+    pub account_name: String,
+    pub server_id: Option<u32>,
+    pub role: LocalRoleProfile,
+}
+
+/// Local replacement for a StoreMgr GsBagItem; instance identity is separate from item ID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LobbyStoreItemSave {
+    pub instance_id: i32,
+    pub item_id: i32,
+    pub count: i32,
+}
+
+/// Explicit role snapshot excludes login credentials and global client preferences.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LocalRoleProfile {
+    pub role_name: String,
     pub level: u32,
     pub exp: u32,
     pub gold: u64,
@@ -872,6 +1015,98 @@ pub struct PlayerProfileSave {
     pub face_item_id: i32,
     pub equipped_prop_idx: usize,
     pub bag_prop_indices: Vec<usize>,
+    #[serde(default)]
+    pub lobby_store_items: Vec<LobbyStoreItemSave>,
+    #[serde(default)]
+    pub lobby_equipped_instance_id: Option<i32>,
+    pub selected_bg_idx: usize,
+}
+
+impl LocalRoleProfile {
+    fn capture(profile: &PlayerProfileSave) -> Self {
+        Self {
+            role_name: profile.role_name.clone(),
+            level: profile.level,
+            exp: profile.exp,
+            gold: profile.gold,
+            diamond: profile.diamond,
+            coupons: profile.coupons,
+            role_preset_id: profile.role_preset_id,
+            sex_male: profile.sex_male,
+            body_variant_idx: profile.body_variant_idx,
+            head_variant_idx: profile.head_variant_idx,
+            hair_variant_idx: profile.hair_variant_idx,
+            skin_color_idx: profile.skin_color_idx,
+            skin_color_id: profile.skin_color_id,
+            hair_color_id: profile.hair_color_id,
+            head_item_id: profile.head_item_id,
+            face_item_id: profile.face_item_id,
+            equipped_prop_idx: profile.equipped_prop_idx,
+            bag_prop_indices: profile.bag_prop_indices.clone(),
+            lobby_store_items: profile.lobby_store_items.clone(),
+            lobby_equipped_instance_id: profile.lobby_equipped_instance_id,
+            selected_bg_idx: profile.selected_bg_idx,
+        }
+    }
+
+    fn apply(self, profile: &mut PlayerProfileSave) {
+        profile.role_name = self.role_name;
+        profile.level = self.level;
+        profile.exp = self.exp;
+        profile.gold = self.gold;
+        profile.diamond = self.diamond;
+        profile.coupons = self.coupons;
+        profile.role_preset_id = self.role_preset_id;
+        profile.sex_male = self.sex_male;
+        profile.body_variant_idx = self.body_variant_idx;
+        profile.head_variant_idx = self.head_variant_idx;
+        profile.hair_variant_idx = self.hair_variant_idx;
+        profile.skin_color_idx = self.skin_color_idx;
+        profile.skin_color_id = self.skin_color_id;
+        profile.hair_color_id = self.hair_color_id;
+        profile.head_item_id = self.head_item_id;
+        profile.face_item_id = self.face_item_id;
+        profile.equipped_prop_idx = self.equipped_prop_idx;
+        profile.bag_prop_indices = self.bag_prop_indices;
+        profile.lobby_store_items = self.lobby_store_items;
+        profile.lobby_equipped_instance_id = self.lobby_equipped_instance_id;
+        profile.selected_bg_idx = self.selected_bg_idx;
+    }
+}
+
+/// Local offline profile, loadout, customization, and `SettingMgr`-aligned preferences
+/// persisted cleanly as JSON on disk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Resource)]
+#[serde(default)]
+pub struct PlayerProfileSave {
+    pub native_settings: std::collections::BTreeMap<String, f32>,
+    /// Native PCKeyCodeCfg row ID to primary/secondary key chords; global client preference.
+    pub native_keybinds: std::collections::BTreeMap<i32, Vec<Vec<i32>>>,
+    pub schema_version: u32,
+    /// Persisted login identity (`PlayerPrefsData.Account`), independent of the role name.
+    pub account_name: String,
+    /// Editable character nickname (`RoleMgr.CreateRoleName`).
+    pub role_name: String,
+    pub level: u32,
+    pub exp: u32,
+    pub gold: u64,
+    pub diamond: u64,
+    pub coupons: u64,
+    pub role_preset_id: i32,
+    pub sex_male: bool,
+    pub body_variant_idx: usize,
+    pub head_variant_idx: usize,
+    pub hair_variant_idx: usize,
+    pub skin_color_idx: usize,
+    pub skin_color_id: i32,
+    pub hair_color_id: i32,
+    pub head_item_id: i32,
+    pub face_item_id: i32,
+    pub equipped_prop_idx: usize,
+    pub bag_prop_indices: Vec<usize>,
+    /// Role-owned lobby storage. StoreMgr stock is replaced by SGsItems; Init grants nothing.
+    pub lobby_store_items: Vec<LobbyStoreItemSave>,
+    pub lobby_equipped_instance_id: Option<i32>,
     pub selected_bg_idx: usize,
     pub music_volume: f32,
     pub sfx_volume: f32,
@@ -882,8 +1117,14 @@ pub struct PlayerProfileSave {
     pub high_contrast_hud: bool,
     #[serde(default = "default_true")]
     pub show_control_hints: bool,
-    /// Accounts that already finished character creation (`PlatformMgr.isCreateRole`).
+    /// Legacy account-only ownership list, retained for migration. `local_roles` owns roles.
     pub created_roles: Vec<String>,
+    pub local_roles: Vec<LocalAccountRoleSave>,
+    pub active_role_key: Option<LocalRoleKey>,
+    /// Old saves with ambiguous ownership retain their role data without assigning it.
+    pub unassigned_legacy_role: Option<LocalRoleProfile>,
+    #[serde(skip, default = "default_true")]
+    pub save_allowed: bool,
     /// Last `AuthMgr.sessionKey` entered in `LoginAccoutPanel`.
     pub session_key: String,
     /// Cached account list mirroring `PlayerPrefs.GetString("dev_Accounts")`.
@@ -893,7 +1134,11 @@ pub struct PlayerProfileSave {
 impl Default for PlayerProfileSave {
     fn default() -> Self {
         Self {
+            native_settings: Default::default(),
+            native_keybinds: Default::default(),
+            schema_version: 2,
             account_name: "Survivor_01".to_owned(),
+            role_name: "Survivor_01".to_owned(),
             level: 1,
             exp: 120,
             gold: 2_500,
@@ -911,6 +1156,8 @@ impl Default for PlayerProfileSave {
             face_item_id: 20550,
             equipped_prop_idx: 4, // wq_m4_1 in manifest.props
             bag_prop_indices: (0..10).collect(),
+            lobby_store_items: Vec::new(),
+            lobby_equipped_instance_id: None,
             selected_bg_idx: 0,
             music_volume: 0.45,
             sfx_volume: 0.75,
@@ -921,6 +1168,10 @@ impl Default for PlayerProfileSave {
             high_contrast_hud: false,
             show_control_hints: true,
             created_roles: Vec::new(),
+            local_roles: Vec::new(),
+            active_role_key: None,
+            unassigned_legacy_role: None,
+            save_allowed: true,
             session_key: String::new(),
             dev_accounts: vec![
                 "Survivor_01".to_owned(),
@@ -950,34 +1201,139 @@ impl PlayerProfileSave {
 
     /// Reads `profile.json` from `path`, gracefully falling back to [`Default::default()`].
     pub fn load_from_disk_or_default(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Self>(&raw).ok())
-            .unwrap_or_default()
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        Self::decode_json(&raw).unwrap_or_else(|err| {
+            warn!("Profile load rejected: {err}. Existing save will be preserved.");
+            Self {
+                save_allowed: false,
+                ..Self::default()
+            }
+        })
     }
 
     /// Writes `self` atomically to `path`, creating parent directories as needed.
     pub fn save_to_disk(&self, path: &Path) -> Result<(), String> {
-        atomic_write_json(path, self)
+        if !self.save_allowed {
+            return Err("Existing profile could not be loaded; preserving that save.".to_owned());
+        }
+        let mut saved = self.clone();
+        saved.stash_active_role();
+        atomic_write_json(path, &saved)
     }
 
-    /// FPS cap label corresponding to APK `SettingMgr::FrameRateQuality` (`0..=3`).
-    pub fn fps_tier_label(tier: u8) -> &'static str {
-        match tier {
-            0 => "Low (30 FPS)",
-            1 => "Medium (45 FPS)",
-            2 => "High (60 FPS)",
-            _ => "Ultra (120 FPS)",
+    /// Explicitly migrate the former single-profile format, where the role editor also
+    /// overwrote `account_name`. Only a sole recorded owner can recover that snapshot.
+    pub fn decode_json(raw: &str) -> Result<Self, String> {
+        let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+        let version = value
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1);
+        if version > 2 {
+            return Err(format!("unsupported profile schema {version}"));
+        }
+        let mut profile: Self = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        if version == 1 {
+            profile.role_name = profile.account_name.clone();
+            profile.created_roles.sort();
+            profile.created_roles.dedup();
+            if let [owner] = profile.created_roles.as_slice() {
+                let owner = owner.clone();
+                profile.local_roles.push(LocalAccountRoleSave {
+                    account_name: owner.clone(),
+                    // The old save did not record a server. Bind it once at next login.
+                    server_id: None,
+                    role: LocalRoleProfile::capture(&profile),
+                });
+                profile.account_name = owner;
+            } else {
+                profile.unassigned_legacy_role = Some(LocalRoleProfile::capture(&profile));
+            }
+            profile.schema_version = 2;
+        }
+        Ok(profile)
+    }
+
+    pub fn has_saved_role(&self, account: &str, server_id: u32) -> bool {
+        self.local_roles.iter().any(|entry| {
+            entry.account_name == account
+                && (entry.server_id == Some(server_id) || entry.server_id.is_none())
+        })
+    }
+
+    /// Activate only this account's role on the selected endpoint. A new account gets a
+    /// fresh character draft; account switching cannot inherit another player's role.
+    pub fn activate_role(&mut self, account: &str, server_id: u32) -> bool {
+        self.stash_active_role();
+        self.account_name = account.to_owned();
+        let key = LocalRoleKey {
+            account_name: account.to_owned(),
+            server_id,
+        };
+        let saved = self
+            .local_roles
+            .iter_mut()
+            .find(|entry| {
+                entry.account_name == account
+                    && (entry.server_id == Some(server_id) || entry.server_id.is_none())
+            })
+            .map(|entry| {
+                entry.server_id = Some(server_id);
+                entry.role.clone()
+            });
+        if let Some(role) = saved {
+            role.apply(self);
+            self.active_role_key = Some(key);
+            true
+        } else {
+            LocalRoleProfile::capture(&Self::default()).apply(self);
+            self.role_name.clear();
+            self.active_role_key = None;
+            false
         }
     }
 
-    /// Graphics quality label corresponding to APK `SettingMgr::QualityLevel` (`0..=2`).
-    pub fn quality_tier_label(tier: u8) -> &'static str {
-        match tier {
-            0 => "Low",
-            1 => "Balanced",
-            _ => "High",
+    pub fn complete_role_creation(&mut self, account: &str, server_id: u32) {
+        self.account_name = account.to_owned();
+        self.active_role_key = Some(LocalRoleKey {
+            account_name: account.to_owned(),
+            server_id,
+        });
+        self.stash_active_role();
+        if !self.created_roles.iter().any(|owner| owner == account) {
+            self.created_roles.push(account.to_owned());
         }
+    }
+
+    fn stash_active_role(&mut self) {
+        let Some(key) = self.active_role_key.clone() else {
+            return;
+        };
+        let role = LocalRoleProfile::capture(self);
+        if let Some(entry) = self.local_roles.iter_mut().find(|entry| {
+            entry.account_name == key.account_name && entry.server_id == Some(key.server_id)
+        }) {
+            entry.role = role;
+        } else {
+            self.local_roles.push(LocalAccountRoleSave {
+                account_name: key.account_name,
+                server_id: Some(key.server_id),
+                role,
+            });
+        }
+    }
+
+}
+
+/// Injectable profile destination; native runtime uses the normal per-user save location.
+#[derive(Debug, Clone, Resource)]
+pub struct PlayerProfileStorage(pub PathBuf);
+
+impl Default for PlayerProfileStorage {
+    fn default() -> Self {
+        Self(PlayerProfileSave::resolve_save_path())
     }
 }
 
@@ -1026,7 +1382,14 @@ impl LocalizationDb {
         if entry.gme_language_type.is_empty() {
             format!("Lang #{}", entry.id)
         } else {
-            format!("{} ({})", entry.gme_language_type, entry.notice_url_suffix.trim_start_matches('_').to_uppercase())
+            format!(
+                "{} ({})",
+                entry.gme_language_type,
+                entry
+                    .notice_url_suffix
+                    .trim_start_matches('_')
+                    .to_uppercase()
+            )
         }
     }
 }
@@ -1062,9 +1425,13 @@ impl Default for PlayerSessionPrefs {
 /// Consolidated runtime game configuration loaded from `assets/config/`.
 #[derive(Debug, Clone, Default, Resource)]
 pub struct GameConfigs {
+    pub native_consts: HashMap<String, serde_json::Value>,
     pub version: VersionInfo,
     pub res_config: ResConfigData,
     pub server_list: ServerListData,
+    pub zhanju_cfgs: Vec<ZhanJuCfgEntry>,
+    pub zhanju_regions: Vec<ZhanjuRegionCfgEntry>,
+    pub battle_maps: Vec<BattleMapCfgEntry>,
     pub main_bgs: Vec<MainBgEntry>,
     pub load_descs: Vec<LoadDescEntry>,
     pub load_panels: Vec<LoadPanelCfgEntry>,
@@ -1093,6 +1460,8 @@ pub struct GameConfigs {
     pub shortcut_keys: Vec<ShortCutKeysEntry>,
     pub pc_key_codes: Vec<PcKeyCodeEntry>,
     pub item_catalog_count: usize,
+    pub item_cfgs: Vec<ItemCfgEntry>,
+    pub drawing_cfgs: Vec<DrawingCfgEntry>,
     pub weapon_catalog: Vec<WeaponCatalogEntry>,
     pub system_item_count: usize,
     pub loaded_small: bool,
@@ -1101,6 +1470,23 @@ pub struct GameConfigs {
 }
 
 impl GameConfigs {
+    pub fn native_const_u64(&self, key: &str) -> Option<u64> {
+        self.native_consts
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+    }
+
+    pub fn recreate_role_money(&self) -> u64 {
+        self.native_const_u64("RECREATE_ROLE_MONEY")
+            .unwrap_or(3_000)
+    }
+
+    pub fn role_name_limit(&self) -> usize {
+        self.native_const_u64("MAX_ROLE_NAME_LENGTH")
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(7)
+    }
+
     pub fn active_server(&self, idx: usize) -> Option<&ServerEntry> {
         self.server_list
             .servers
@@ -1159,12 +1545,21 @@ impl GameConfigs {
         self.skin_colors.iter().find(|s| s.id == id)
     }
 
-    /// Mirrors `EstablishPanel.ReRandomName`: generates a valid role name from `MultiLanguageNameCfg`
-    /// (for non-CN languages) or `Name1Cfg..Name5Cfg` (for CN).
+    /// Deterministic local recommendation using native name tables. The original client
+    /// requests recommendations from the server; server selection parity remains unknown.
     pub fn generate_random_role_name(&self, lang_index: i32, seed: usize) -> String {
         let sanitize = |s: &str| -> String {
             s.chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                .filter(|c| !crate::auth::SPECIAL_NAME_CHARACTERS.contains(*c))
+                .collect()
+        };
+        let limit_name = |s: &str| -> String {
+            let mut units = 0;
+            s.chars()
+                .take_while(|c| {
+                    units += c.len_utf16();
+                    units <= self.role_name_limit()
+                })
                 .collect()
         };
         if lang_index > 0 && !self.multilang_names.is_empty() {
@@ -1176,8 +1571,9 @@ impl GameConfigs {
             let a = row_a.get(col_a).map(|s| sanitize(s)).unwrap_or_default();
             let b = row_b.get(col_b).map(|s| sanitize(s)).unwrap_or_default();
             let combined = format!("{a}{b}");
-            if combined.chars().count() >= 2 {
-                return combined.chars().take(12).collect();
+            let limited = limit_name(&combined);
+            if crate::auth::check_name(&limited).is_none() {
+                return limited;
             }
         }
         let p1 = &self.cn_name_pools[1];
@@ -1195,17 +1591,22 @@ impl GameConfigs {
             };
             let b = sanitize(&b_pool[(seed.wrapping_mul(53).wrapping_add(11)) % b_pool.len()]);
             let combined = format!("{a}{b}");
-            if combined.chars().count() >= 2 {
-                return combined.chars().take(12).collect();
+            let limited = limit_name(&combined);
+            if crate::auth::check_name(&limited).is_none() {
+                return limited;
             }
         }
-        format!("Survivor_{:02}", (seed % 99) + 1)
+        String::new()
     }
 
     /// Resolves an APK `LoadPanelCfg.texture` path (e.g. `"texture/loading_6"`) into an exported
     /// Pure-Bevy PNG asset path (`"ui/Loading_6.png"`).
     pub fn resolve_load_panel_texture_asset(tex_field: &str) -> Option<String> {
-        let stem = tex_field.trim().rsplit('/').next()?.trim_end_matches(".png");
+        let stem = tex_field
+            .trim()
+            .rsplit('/')
+            .next()?
+            .trim_end_matches(".png");
         let low = stem.to_ascii_lowercase();
         let file = match low.as_str() {
             "loading_5" => "ui/Loading_5.png",
@@ -1231,7 +1632,7 @@ pub struct ConfigLoadProgress {
 type MultilangMapResult = Result<
     (
         HashMap<String, Vec<String>>,
-        usize,
+        Vec<ItemCfgEntry>,
         Vec<WeaponCatalogEntry>,
         HashMap<i32, String>,
         Vec<Vec<String>>,
@@ -1252,9 +1653,13 @@ struct PreloadStateCtx<'w> {
 }
 
 struct SmallConfigBundle {
+    native_consts: HashMap<String, serde_json::Value>,
     version: VersionInfo,
     res_config: ResConfigData,
     server_list: ServerListData,
+    zhanju_cfgs: Vec<ZhanJuCfgEntry>,
+    zhanju_regions: Vec<ZhanjuRegionCfgEntry>,
+    battle_maps: Vec<BattleMapCfgEntry>,
     lang_indices: Vec<MultiLanguageIndexEntry>,
     main_bgs: Vec<MainBgEntry>,
     load_descs: Vec<LoadDescEntry>,
@@ -1282,6 +1687,7 @@ struct SmallConfigBundle {
     shortcut_keys: Vec<ShortCutKeysEntry>,
     pc_key_codes: Vec<PcKeyCodeEntry>,
     system_item_count: usize,
+    drawing_cfgs: Vec<DrawingCfgEntry>,
     warnings: Vec<String>,
 }
 
@@ -1355,7 +1761,10 @@ pub fn parse_server_list_xml(raw: &str) -> ServerListData {
                 .get("port")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(9211);
-            let status_code = attrs.get("status").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let status_code = attrs
+                .get("status")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             out.servers.push(ServerEntry {
                 id,
                 mode: ServerModeType::from_code(type_code),
@@ -1410,6 +1819,16 @@ fn parse_xml_attributes(tag_body: &str) -> HashMap<String, String> {
 
 fn load_small_configs_from_dir(cfg_dir: &Path) -> SmallConfigBundle {
     let mut warnings = Vec::new();
+
+    let zhanju_cfgs: DecodedOcFile<ZhanJuCfgEntry> =
+        read_json_or_warn(cfg_dir, "cfg.ZhanJuCfg.json", &mut warnings);
+    let zhanju_regions: DecodedOcFile<ZhanjuRegionCfgEntry> =
+        read_json_or_warn(cfg_dir, "cfg.ZhanjuRegionCfg.json", &mut warnings);
+    let battle_maps: DecodedOcFile<BattleMapCfgEntry> =
+        read_json_or_warn(cfg_dir, "cfg.MapCfg.json", &mut warnings);
+
+    let native_consts: DecodedOcFile<HashMap<String, serde_json::Value>> =
+        read_json_or_warn(cfg_dir, "cfg.Consts.json", &mut warnings);
 
     let version: VersionInfo = read_json_or_warn(cfg_dir, "version.txt", &mut warnings);
     let res_config = match std::fs::read_to_string(cfg_dir.join("ResConfig.txt")) {
@@ -1473,42 +1892,63 @@ fn load_small_configs_from_dir(cfg_dir: &Path) -> SmallConfigBundle {
     let equip_cfgs: DecodedOcFile<EquipCfgEntry> =
         read_json_or_warn(cfg_dir, "cfg.EquipCfg.json", &mut warnings);
     let cn_name_pools = [
-        read_json_or_warn::<DecodedOcFile<SimpleNameEntry>>(cfg_dir, "cfg.Name1Cfg.json", &mut warnings)
-            .records
-            .into_iter()
-            .map(|r| r.name)
-            .filter(|s| !s.is_empty())
-            .collect(),
-        read_json_or_warn::<DecodedOcFile<SimpleNameEntry>>(cfg_dir, "cfg.Name2Cfg.json", &mut warnings)
-            .records
-            .into_iter()
-            .map(|r| r.name)
-            .filter(|s| !s.is_empty())
-            .collect(),
-        read_json_or_warn::<DecodedOcFile<SimpleNameEntry>>(cfg_dir, "cfg.Name3Cfg.json", &mut warnings)
-            .records
-            .into_iter()
-            .map(|r| r.name)
-            .filter(|s| !s.is_empty())
-            .collect(),
-        read_json_or_warn::<DecodedOcFile<SimpleNameEntry>>(cfg_dir, "cfg.Name4Cfg.json", &mut warnings)
-            .records
-            .into_iter()
-            .map(|r| r.name)
-            .filter(|s| !s.is_empty())
-            .collect(),
-        read_json_or_warn::<DecodedOcFile<SimpleNameEntry>>(cfg_dir, "cfg.Name5Cfg.json", &mut warnings)
-            .records
-            .into_iter()
-            .map(|r| r.name)
-            .filter(|s| !s.is_empty())
-            .collect(),
+        read_json_or_warn::<DecodedOcFile<SimpleNameEntry>>(
+            cfg_dir,
+            "cfg.Name1Cfg.json",
+            &mut warnings,
+        )
+        .records
+        .into_iter()
+        .map(|r| r.name)
+        .filter(|s| !s.is_empty())
+        .collect(),
+        read_json_or_warn::<DecodedOcFile<SimpleNameEntry>>(
+            cfg_dir,
+            "cfg.Name2Cfg.json",
+            &mut warnings,
+        )
+        .records
+        .into_iter()
+        .map(|r| r.name)
+        .filter(|s| !s.is_empty())
+        .collect(),
+        read_json_or_warn::<DecodedOcFile<SimpleNameEntry>>(
+            cfg_dir,
+            "cfg.Name3Cfg.json",
+            &mut warnings,
+        )
+        .records
+        .into_iter()
+        .map(|r| r.name)
+        .filter(|s| !s.is_empty())
+        .collect(),
+        read_json_or_warn::<DecodedOcFile<SimpleNameEntry>>(
+            cfg_dir,
+            "cfg.Name4Cfg.json",
+            &mut warnings,
+        )
+        .records
+        .into_iter()
+        .map(|r| r.name)
+        .filter(|s| !s.is_empty())
+        .collect(),
+        read_json_or_warn::<DecodedOcFile<SimpleNameEntry>>(
+            cfg_dir,
+            "cfg.Name5Cfg.json",
+            &mut warnings,
+        )
+        .records
+        .into_iter()
+        .map(|r| r.name)
+        .filter(|s| !s.is_empty())
+        .collect(),
     ];
     let build_parts: DecodedOcFile<BuildPartEntry> =
         read_json_or_warn(cfg_dir, "cfg.BuildPart.json", &mut warnings);
     let tree_cfgs: DecodedOcFile<TreeCfgEntry> =
         read_json_or_warn(cfg_dir, "cfg.TreeCfg.json", &mut warnings);
-    let scene_cell_file: SceneCellFile = read_json_or_warn(cfg_dir, "scenecell.json", &mut warnings);
+    let scene_cell_file: SceneCellFile =
+        read_json_or_warn(cfg_dir, "scenecell.json", &mut warnings);
     let turret_cfgs: DecodedOcFile<TurretCfgEntry> =
         read_json_or_warn(cfg_dir, "cfg.TurretCfg.json", &mut warnings);
     let monster_cfgs: DecodedOcFile<MonsterCfgEntry> =
@@ -1529,8 +1969,14 @@ fn load_small_configs_from_dir(cfg_dir: &Path) -> SmallConfigBundle {
         read_json_or_warn(cfg_dir, "cfg.PCKeyCodeCfg.json", &mut warnings);
     let system_items: DecodedOcFile<serde_json::Value> =
         read_json_or_warn(cfg_dir, "cfg.SystemItemCfg.json", &mut warnings);
+    let drawing_cfgs: DecodedOcFile<DrawingCfgEntry> =
+        read_json_or_warn(cfg_dir, "cfg.DrawingCfg.json", &mut warnings);
 
     SmallConfigBundle {
+        zhanju_cfgs: zhanju_cfgs.records,
+        zhanju_regions: zhanju_regions.records,
+        battle_maps: battle_maps.records,
+        native_consts: native_consts.records.into_iter().next().unwrap_or_default(),
         version,
         res_config,
         server_list,
@@ -1561,6 +2007,7 @@ fn load_small_configs_from_dir(cfg_dir: &Path) -> SmallConfigBundle {
         shortcut_keys: shortcut_keys.records,
         pc_key_codes: pc_key_codes.records,
         system_item_count: system_items.records.len(),
+        drawing_cfgs: drawing_cfgs.records,
         warnings,
     }
 }
@@ -1599,13 +2046,16 @@ fn build_weapon_catalog_from_dir(
     guns: &[GunCfgEntry],
     close_weapons: &[CloseWeaponEntry],
     prop_names: &[String],
-) -> (usize, Vec<WeaponCatalogEntry>, HashMap<i32, String>) {
+) -> (
+    Vec<ItemCfgEntry>,
+    Vec<WeaponCatalogEntry>,
+    HashMap<i32, String>,
+) {
     let item_path = cfg_dir.join("cfg.ItemCfg.json");
     let parsed: DecodedOcFile<ItemCfgEntry> = std::fs::read_to_string(&item_path)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
-    let total_items = parsed.records.len();
 
     let mut starter_icons = HashMap::new();
     let mut by_model_stem: HashMap<String, &ItemCfgEntry> = HashMap::new();
@@ -1638,20 +2088,28 @@ fn build_weapon_catalog_from_dir(
         let category_cn = gun_match
             .map(|g| g.gun_type_name.clone())
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| if melee_match.is_some() { "Melee".to_owned() } else { "Tactical".to_owned() });
+            .unwrap_or_else(|| {
+                if melee_match.is_some() {
+                    "Melee".to_owned()
+                } else {
+                    "Tactical".to_owned()
+                }
+            });
         let sound_hint = gun_match
             .map(|g| g.sound_setting_path.clone())
             .unwrap_or_default();
         catalog.push(WeaponCatalogEntry {
             item_id,
-            name_cn: matched.map(|m| m.name.clone()).unwrap_or_else(|| name.clone()),
+            name_cn: matched
+                .map(|m| m.name.clone())
+                .unwrap_or_else(|| name.clone()),
             category_cn,
             base_damage,
             quality: matched.map(|m| m.quality).unwrap_or(1),
             sound_hint,
         });
     }
-    (total_items, catalog, starter_icons)
+    (parsed.records, catalog, starter_icons)
 }
 
 fn read_json_or_warn<T: for<'de> Deserialize<'de> + Default>(
@@ -1681,29 +2139,33 @@ impl Plugin for GameConfigPlugin {
             .init_resource::<LocalizationDb>()
             .init_resource::<PlayerSessionPrefs>()
             .init_resource::<PlayerProfileSave>()
+            .init_resource::<PlayerProfileStorage>()
             .init_resource::<ConfigLoadProgress>()
             .add_systems(OnEnter(AppState::Boot), start_boot_preload)
             .add_systems(
                 Update,
                 poll_config_preload.run_if(
-                    in_state(AppState::PreloadConfigs)
-                        .or_else(in_state(AppState::LauncherSplash)),
+                    in_state(AppState::PreloadConfigs).or_else(in_state(AppState::LauncherSplash)),
                 ),
             );
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Bevy injects the boot system's resources, including the testable profile destination."
+)]
 fn start_boot_preload(
     mut commands: Commands,
     mut configs: ResMut<GameConfigs>,
     mut l10n: ResMut<LocalizationDb>,
     mut prefs: ResMut<PlayerSessionPrefs>,
     mut profile: ResMut<PlayerProfileSave>,
+    profile_storage: Res<PlayerProfileStorage>,
     mut progress: ResMut<ConfigLoadProgress>,
     mut next_state: ResMut<NextState<AppState>>,
 ) {
-    let save_path = PlayerProfileSave::resolve_save_path();
-    *profile = PlayerProfileSave::load_from_disk_or_default(&save_path);
+    *profile = PlayerProfileSave::load_from_disk_or_default(&profile_storage.0);
     prefs.account_name = profile.account_name.clone();
     prefs.session_key = profile.session_key.clone();
     l10n.selected_lang_index = profile.lang_index;
@@ -1715,9 +2177,13 @@ fn start_boot_preload(
         .unwrap_or_default();
 
     let bundle = load_small_configs_from_dir(&cfg_dir);
+    configs.native_consts = bundle.native_consts;
     configs.version = bundle.version;
     configs.res_config = bundle.res_config;
     configs.server_list = bundle.server_list;
+    configs.zhanju_cfgs = bundle.zhanju_cfgs;
+    configs.zhanju_regions = bundle.zhanju_regions;
+    configs.battle_maps = bundle.battle_maps;
     l10n.index_entries = bundle.lang_indices;
     configs.main_bgs = bundle.main_bgs;
     configs.load_descs = bundle.load_descs;
@@ -1745,6 +2211,7 @@ fn start_boot_preload(
     configs.shortcut_keys = bundle.shortcut_keys;
     configs.pc_key_codes = bundle.pc_key_codes;
     configs.system_item_count = bundle.system_item_count;
+    configs.drawing_cfgs = bundle.drawing_cfgs;
     configs.warnings.extend(bundle.warnings);
     configs.loaded_small = true;
 
@@ -1753,10 +2220,10 @@ fn start_boot_preload(
     let pool = IoTaskPool::get();
     let lang_task = pool.spawn(async move {
         let map = load_multilang_map_from_dir(&cfg_dir)?;
-        let (item_cnt, catalog, starter_icons) =
+        let (items, catalog, starter_icons) =
             build_weapon_catalog_from_dir(&cfg_dir, &guns_bg, &melee_bg, &manifest_props);
         let ml_names = load_multilang_names_from_dir(&cfg_dir);
-        Ok((map, item_cnt, catalog, starter_icons, ml_names))
+        Ok((map, items, catalog, starter_icons, ml_names))
     });
 
     commands.insert_resource(PendingMultilangTask(Some(lang_task)));
@@ -1781,9 +2248,10 @@ fn poll_config_preload(
         && let Some(res) = block_on(poll_once(task))
     {
         match res {
-            Ok((map, item_cnt, catalog, starter_icons, ml_names)) => {
+            Ok((map, items, catalog, starter_icons, ml_names)) => {
                 ctx.l10n.by_key = map;
-                ctx.configs.item_catalog_count = item_cnt;
+                ctx.configs.item_catalog_count = items.len();
+                ctx.configs.item_cfgs = items;
                 ctx.configs.weapon_catalog = catalog;
                 ctx.configs.starter_item_icons = starter_icons;
                 ctx.configs.multilang_names = ml_names;
@@ -1834,7 +2302,10 @@ mod tests {
             small.server_list.servers.iter().any(|s| s.id == 167),
             "serverList.xml must include server 167"
         );
-        assert!(!small.lang_indices.is_empty(), "MultiLanguageIndexCfg must load");
+        assert!(
+            !small.lang_indices.is_empty(),
+            "MultiLanguageIndexCfg must load"
+        );
         assert!(!small.close_weapons.is_empty(), "CloseWeaponCfg must load");
         assert!(small.warnings.is_empty(), "warnings: {:?}", small.warnings);
 
@@ -1852,18 +2323,42 @@ mod tests {
         assert!(!small.role_fashions.is_empty());
         assert!(!small.turret_cfgs.is_empty(), "TurretCfg must load");
         assert!(!small.monster_cfgs.is_empty(), "MonsterCfg must load");
-        assert!(!small.port_boss_cfgs.is_empty(), "PortBossMonsterCfg must load");
+        assert!(
+            !small.port_boss_cfgs.is_empty(),
+            "PortBossMonsterCfg must load"
+        );
         assert!(!small.vehicle_cfgs.is_empty(), "VehicleCfg must load");
         assert!(!small.car_cfgs.is_empty(), "CarCfg must load");
-        assert!(!small.electric_turret_cfgs.is_empty(), "ElectricTurretCfg must load");
-        assert!(!small.battery_cfgs.is_empty(), "BatteryCapacityCfg must load");
+        assert!(
+            !small.electric_turret_cfgs.is_empty(),
+            "ElectricTurretCfg must load"
+        );
+        assert!(
+            !small.battery_cfgs.is_empty(),
+            "BatteryCapacityCfg must load"
+        );
         assert!(!small.shortcut_keys.is_empty(), "ShortCutKeysCfg must load");
         assert!(!small.pc_key_codes.is_empty(), "PCKeyCodeCfg must load");
-        assert!(small.load_panels.len() >= 3, "LoadPanelCfg must load 3 backdrops");
-        assert!(small.strings.contains_key(&435), "Strings must contain ID 435");
-        assert!(small.strings.contains_key(&436), "Strings must contain ID 436");
-        assert!(small.strings.contains_key(&445), "Strings must contain ID 445");
-        assert!(small.strings.contains_key(&446), "Strings must contain ID 446");
+        assert!(
+            small.load_panels.len() >= 3,
+            "LoadPanelCfg must load 3 backdrops"
+        );
+        assert!(
+            small.strings.contains_key(&435),
+            "Strings must contain ID 435"
+        );
+        assert!(
+            small.strings.contains_key(&436),
+            "Strings must contain ID 436"
+        );
+        assert!(
+            small.strings.contains_key(&445),
+            "Strings must contain ID 445"
+        );
+        assert!(
+            small.strings.contains_key(&446),
+            "Strings must contain ID 446"
+        );
         assert!(
             !small.battle_loading_tips.is_empty(),
             "BattleLoadingTipsCfg must load"
@@ -1881,20 +2376,34 @@ mod tests {
             selected_lang_index: -1,
             ..default()
         };
-        assert_eq!(gc.get_string(&raw_l10n, 436, &["1.00M", "2.00M"]), "1.00M/2.00M");
+        assert_eq!(
+            gc.get_string(&raw_l10n, 436, &["1.00M", "2.00M"]),
+            "1.00M/2.00M"
+        );
 
-        let (item_cnt, catalog, starter_icons) = build_weapon_catalog_from_dir(
+        let (items, catalog, starter_icons) = build_weapon_catalog_from_dir(
             cfg_dir,
             &small.guns,
             &small.close_weapons,
             &["wq_m4_1".to_owned(), "wq_bq_1".to_owned()],
         );
-        assert!(item_cnt > 10_000, "ItemCfg.json must load 16k+ items");
+        assert!(items.len() > 10_000, "ItemCfg.json must load 16k+ items");
+        assert_eq!(small.drawing_cfgs.len(), 315);
+        let bandage = items.iter().find(|item| item.id == 55101).unwrap();
+        assert_eq!(bandage.child_type, 32);
+        assert_eq!(bandage.max_pile_num, 10);
+        assert_eq!(bandage.extras[0], 20.0);
         assert_eq!(catalog.len(), 2);
         assert_eq!(catalog[0].item_id, 52231);
-        assert_eq!(starter_icons.get(&20500).map(String::as_str), Some("head1/man_fa_2_1"));
+        assert_eq!(
+            starter_icons.get(&20500).map(String::as_str),
+            Some("head1/man_fa_2_1")
+        );
         assert!(!small.equip_cfgs.is_empty(), "EquipCfg.json must load");
-        assert!(!small.cn_name_pools[1].is_empty(), "Name2Cfg.json must load");
+        assert!(
+            !small.cn_name_pools[1].is_empty(),
+            "Name2Cfg.json must load"
+        );
     }
 
     #[test]
@@ -1911,11 +2420,96 @@ mod tests {
             music_volume: 0.25,
             ..Default::default()
         };
-        profile.save_to_disk(&tmp).expect("save_to_disk must succeed");
+        profile
+            .save_to_disk(&tmp)
+            .expect("save_to_disk must succeed");
         let loaded = PlayerProfileSave::load_from_disk_or_default(&tmp);
         assert_eq!(profile, loaded);
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn role_snapshots_isolate_accounts_and_servers_and_keep_preferences() {
+        let mut profile = PlayerProfileSave {
+            music_volume: 0.23,
+            ..Default::default()
+        };
+        assert!(!profile.activate_role("Account_A", 10));
+        assert!(profile.role_name.is_empty());
+        profile.role_name = "角色A".to_owned();
+        profile.sex_male = false;
+        profile.gold = 725;
+        profile.complete_role_creation("Account_A", 10);
+        profile.role_name = "Renamed".to_owned();
+        assert!(!profile.activate_role("Account_B", 10));
+        assert!(!profile.has_saved_role("Account_B", 10));
+        assert!(profile.role_name.is_empty());
+        assert!(profile.sex_male);
+        profile.role_name = "Role_B".to_owned();
+        profile.complete_role_creation("Account_B", 10);
+        assert!(!profile.activate_role("Account_A", 11));
+        assert!(profile.activate_role("Account_A", 10));
+        assert_eq!(profile.account_name, "Account_A");
+        assert_eq!(profile.role_name, "Renamed");
+        assert!(!profile.sex_male);
+        assert_eq!(profile.gold, 725);
+        assert_eq!(profile.music_volume, 0.23);
+        assert!(profile.activate_role("Account_B", 10));
+        assert_eq!(profile.role_name, "Role_B");
+    }
+
+    #[test]
+    fn legacy_role_migrates_only_to_its_single_recorded_owner_once() {
+        let raw = r#"{"account_name":"OldNickname","created_roles":["Account_A"],"gold":4321}"#;
+        let mut profile = PlayerProfileSave::decode_json(raw).expect("legacy save");
+        assert_eq!(profile.account_name, "Account_A");
+        assert!(!profile.has_saved_role("Account_B", 10));
+        assert!(profile.activate_role("Account_A", 10));
+        assert_eq!(profile.role_name, "OldNickname");
+        assert_eq!(profile.gold, 4321);
+        assert!(!profile.has_saved_role("Account_A", 11));
+        let raw = serde_json::to_string(&profile).expect("serialized migrated save");
+        let restored = PlayerProfileSave::decode_json(&raw).expect("schema 2");
+        assert_eq!(restored, profile);
+    }
+
+    #[test]
+    fn ambiguous_legacy_ownership_preserves_data_without_granting_a_role() {
+        let raw = r#"{"account_name":"OldNickname","created_roles":["A","B"],"gold":4321}"#;
+        let mut profile = PlayerProfileSave::decode_json(raw).expect("legacy save");
+        assert!(!profile.has_saved_role("A", 10));
+        assert!(!profile.has_saved_role("B", 10));
+        assert!(!profile.activate_role("A", 10));
+        let legacy = profile
+            .unassigned_legacy_role
+            .as_ref()
+            .expect("retained role data");
+        assert_eq!(legacy.role_name, "OldNickname");
+        assert_eq!(legacy.gold, 4321);
+    }
+
+    #[test]
+    fn saving_snapshots_active_role_and_future_schema_is_preserved() {
+        let tmp = std::env::temp_dir().join("bevy_zero_game_role_snapshot_test.json");
+        let mut profile = PlayerProfileSave::default();
+        profile.activate_role("Account_A", 10);
+        profile.role_name = "Created".to_owned();
+        profile.complete_role_creation("Account_A", 10);
+        profile.role_name = "Renamed".to_owned();
+        profile.save_to_disk(&tmp).expect("save active role");
+        let mut restored = PlayerProfileSave::load_from_disk_or_default(&tmp);
+        assert!(restored.activate_role("Account_A", 10));
+        assert_eq!(restored.role_name, "Renamed");
+        let future = r#"{"schema_version":3,"account_name":"FutureAccount"}"#;
+        std::fs::write(&tmp, future).expect("future fixture");
+        let rejected = PlayerProfileSave::load_from_disk_or_default(&tmp);
+        assert!(rejected.save_to_disk(&tmp).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&tmp).expect("preserved future save"),
+            future
+        );
+        let _ = std::fs::remove_file(tmp);
     }
 
     #[test]
@@ -1944,6 +2538,7 @@ mod tests {
                 is_open: true,
                 fuel: 750,
             }],
+            ..Default::default()
         };
         base.save_atomic(&tmp).expect("save_atomic must succeed");
         let loaded = BaseSaveData::load_from_disk(&tmp).expect("load_from_disk must decode");
@@ -1951,7 +2546,10 @@ mod tests {
 
         let mut kb = KeybindProfile::preset(1);
         assert_eq!(kb.interact_key, "KeyE");
-        assert_eq!(KeybindProfile::keycode(&kb.interact_key), bevy::prelude::KeyCode::KeyE);
+        assert_eq!(
+            KeybindProfile::keycode(&kb.interact_key),
+            bevy::prelude::KeyCode::KeyE
+        );
         kb.cycle_interact_key();
         assert_eq!(kb.interact_key, "KeyO");
 

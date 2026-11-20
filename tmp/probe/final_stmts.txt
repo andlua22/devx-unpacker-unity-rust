@@ -1,0 +1,49 @@
+IL2CPP_InitMetadata(void*.ptr_0x476d570);
+generic generic;
+if (this.<>1__state == 1)
+{
+	*(int*)(this.<curInfo>5__3 -32) = -1;
+	if (this.<curInfo>5__3 == null) return result;
+	this.<curInfo>5__3.createNum = this.<curInfo>5__3.createNum - 1;
+	if (this.<createInfo>5__4 == null) return result;
+	if (this.<>4__this == null) return result;
+	this.<>4__this.AddItemToBag(this.<createInfo>5__4.targetItemId, this.<createInfo>5__4.productNum);
+	this.<>4__this.AddItemToBag(this.<createInfo>5__4.targetItemId, this.<createInfo>5__4.productNum);
+	if (this.<curInfo>5__3 == null) return result;
+	if (this.<curInfo>5__3.createNum <= 0 && this.<createInfos>5__2 != null)
+	{
+		this.<createInfos>5__2.RemoveAt(0);
+		this.<>4__this._createList.handle();
+	}
+	*(nint*)(this.<curInfo>5__3) = 0;
+	*(nint*)(this.<curInfo>5__3 +8) = 0;
+	generic = this.<createInfos>5__2;
+	if (this.<createInfos>5__2 != null)
+	{
+		L3:
+		if (*(nint*)(generic +24) <= 0)
+		{
+			this.<>4__this._mCreateCoroutine = 0;
+		} else {
+			this.<curInfo>5__3 = generic[0];
+			if (generic[0] == null) return result;
+			var drawingCfg = DrawingCfg.Get(*(nint*)(generic[0] +16));
+			this.<createInfo>5__4 = drawingCfg;
+			if (drawingCfg != 0)
+			{
+				this.<>2__current = Utils.WaitForSeconds(__abi);
+				this.<>1__state = 1;
+				return true;
+			}
+		}
+		return 0;
+	}
+} else {
+	if (this.<>1__state != 0) return false;
+	this.<>1__state = -1;
+	this.<createInfos>5__2 = this.<>4__this._createList.ceateInfos;
+	generic = this.<>4__this._createList.ceateInfos;
+	if (this.<>4__this._createList.ceateInfos != 0) goto L3;
+	return result;
+}
+return result;

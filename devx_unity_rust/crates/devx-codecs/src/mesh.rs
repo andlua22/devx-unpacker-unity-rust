@@ -449,6 +449,19 @@ fn extract_mesh_skin(
         (Vec::new(), Vec::new())
     };
 
+    // Unity omits the weight stream for optimized one-influence meshes. The
+    // remaining scalar bone index carries an implicit unit weight.
+    if !is_legacy_channels
+        && channels.get(12).is_some_and(|ch| ch.dimension & 0x0F == 0)
+        && channels.get(13).is_some_and(|ch| ch.dimension & 0x0F == 1)
+        && weights.is_empty()
+        && joints.len() == vcount
+        && !bind_poses_row_major.is_empty()
+        && joints.iter().all(|j| usize::from(j[0]) < bind_poses_row_major.len())
+    {
+        weights.resize(vcount, [1.0, 0.0, 0.0, 0.0]);
+    }
+
     if (weights.len() != vcount || joints.len() != vcount)
         && let Some(skin_arr) = props.get("m_Skin").and_then(|v| v.as_array())
         && !skin_arr.is_empty()
@@ -1628,6 +1641,33 @@ mod tests {
         assert_eq!(joints[0], [3, 7, 0, 0]);
         assert_eq!(weights[1], [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(joints[1], [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn decodes_optimized_one_influence_skin_and_rejects_incomplete_indices() {
+        let mut matrix = indexmap::IndexMap::new();
+        for row in 0..4 {
+            for col in 0..4 {
+                matrix.insert(format!("e{row}{col}"), UnityValue::Float(if row == col { 1.0 } else { 0.0 }));
+            }
+        }
+        let mut props = indexmap::IndexMap::new();
+        props.insert("m_BindPose".into(), UnityValue::Array(vec![
+            UnityValue::Object(matrix.clone()), UnityValue::Object(matrix),
+        ]));
+        let mut channels = vec![ChannelInfo { stream: 0, offset: 0, format: 0, dimension: 0 }; 14];
+        channels[13] = ChannelInfo { stream: 0, offset: 0, format: 10, dimension: 1 };
+        let layouts = compute_stream_layouts(&channels, 3, &[]);
+        let bytes: Vec<u8> = [0u32, 1, 0].into_iter().flat_map(u32::to_le_bytes).collect();
+        let skin = extract_mesh_skin(&props, &channels, false, 3, &layouts, &bytes).unwrap();
+        assert_eq!(skin.joints, [[0, 0, 0, 0], [1, 0, 0, 0], [0, 0, 0, 0]]);
+        assert_eq!(skin.weights, [[1.0, 0.0, 0.0, 0.0]; 3]);
+        let truncated = extract_mesh_skin(&props, &channels, false, 3, &layouts, &bytes[..8]).unwrap();
+        assert!(truncated.joints.is_empty());
+        assert!(truncated.weights.is_empty());
+        channels[13].dimension = 2;
+        let ambiguous = extract_mesh_skin(&props, &channels, false, 3, &layouts, &bytes).unwrap();
+        assert!(ambiguous.weights.is_empty());
     }
 
     #[test]

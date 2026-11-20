@@ -1267,6 +1267,7 @@ impl<'a> GltfBuildCtx<'a> {
             return None;
         }
         let decoded: DecodedMaterial = decode_material(&mat_obj).ok()?;
+        let terrain_extras = self.export_terrain_layer_metadata(mat_ref, &decoded);
 
         let base_color = decoded.base_color();
         let metallic = decoded.metallic_factor();
@@ -1371,11 +1372,53 @@ impl<'a> GltfBuildCtx<'a> {
                 emissive_texture,
                 emissive_factor,
                 extensions: None,
-                extras: Default::default(),
+                extras: terrain_extras,
             },
         );
         self.material_cache.insert(mat_ref, mat_idx);
         Some(mat_idx)
+    }
+
+    /// Retains native TerrainMeshBase layer textures and shader scalars for a per-fragment
+    /// renderer. A control map is blend data, never an albedo image. Keeping originals avoids
+    /// flattening 40-90 repeated tiles into a low-resolution whole-chunk texture.
+    fn export_terrain_layer_metadata(&mut self, mat_ref: UnityRef, material: &DecodedMaterial) -> json::Extras {
+        if !self.opts.include_textures { return None; }
+        let shader_ref = self.resolve_material_tex_pptr(mat_ref.0, material.shader_file_id, material.shader_path_id)?;
+        let shader = self.try_read_object(shader_ref)?;
+        let shader_name = shader.class.properties().get("m_ParsedForm")?.as_object()?.get("m_Name")?.as_str()?;
+        let layer_count = match shader_name {
+            "_URP/TerrainMeshBase/4 Textures" => 4,
+            "_URP/TerrainMeshBase/3 Textures" => 3,
+            _ => return None,
+        };
+        let control_slot = material.find_texture_slot(&["_Control"])?;
+        let control_ref = self.resolve_material_tex_pptr(mat_ref.0, control_slot.texture_file_id, control_slot.texture_path_id)?;
+        let control = self.get_or_create_texture(control_ref, false)?;
+        let mut layers = Vec::new();
+        for index in 0..layer_count {
+            let name = format!("_Splat{index}");
+            let slot = material.find_texture_slot(&[&name])?;
+            let texture_ref = self.resolve_material_tex_pptr(mat_ref.0, slot.texture_file_id, slot.texture_path_id)?;
+            let texture = self.get_or_create_texture(texture_ref, false)?;
+            let normal_name = format!("_Splat{index}_Normal");
+            let normal = material.find_texture_slot(&[&normal_name]).and_then(|s| {
+                self.resolve_material_tex_pptr(mat_ref.0, s.texture_file_id, s.texture_path_id)
+                    .and_then(|r| self.get_or_create_texture(r, false))
+            });
+            layers.push(json!({
+                "texture": texture.value(), "normal_texture": normal.map(|n| n.value()),
+                "scale": material.find_float(&[&format!("_Splat{index}_S")]).unwrap_or(1.0),
+                "smoothness": material.find_float(&[&format!("_Splat{index}_Smoothness")]).unwrap_or(0.5),
+                "source_property": name,
+            }));
+        }
+        json::extras::RawValue::from_string(json!({"devx_terrain": {
+            "version": 1, "shader": shader_name, "control_texture": control.value(),
+            "control_st": [control_slot.scale[0], control_slot.scale[1], control_slot.offset[0], control_slot.offset[1]],
+            "normal_enabled": material.valid_keywords.iter().any(|k| k == "_NORMALMAP"),
+            "layers": layers,
+        }}).to_string()).ok()
     }
 
     fn resolve_material_tex_pptr(
@@ -1499,7 +1542,7 @@ impl<'a> GltfBuildCtx<'a> {
                 )
             }
         };
-        let sampler_idx = self.ensure_default_sampler();
+        let sampler_idx = self.texture_sampler(&tex_obj);
         let tex_idx = json::Index::push(
             &mut self.root.textures,
             json::Texture {
@@ -1512,6 +1555,28 @@ impl<'a> GltfBuildCtx<'a> {
         );
         self.texture_cache.insert(key, tex_idx);
         Some(tex_idx)
+    }
+
+    fn texture_sampler(&mut self, texture: &UnityObject) -> json::Index<json::texture::Sampler> {
+        let Some(settings) = texture.class.properties().get("m_TextureSettings").and_then(UnityValue::as_object) else {
+            return self.ensure_default_sampler();
+        };
+        let wrap = |field: &str| match settings.get(field).and_then(extract_i32_field).unwrap_or(0) {
+            1 => json::texture::WrappingMode::ClampToEdge,
+            2 => json::texture::WrappingMode::MirroredRepeat,
+            _ => json::texture::WrappingMode::Repeat,
+        };
+        let (mag, min) = match settings.get("m_FilterMode").and_then(extract_i32_field).unwrap_or(1) {
+            0 => (json::texture::MagFilter::Nearest, json::texture::MinFilter::NearestMipmapNearest),
+            2 => (json::texture::MagFilter::Linear, json::texture::MinFilter::LinearMipmapLinear),
+            _ => (json::texture::MagFilter::Linear, json::texture::MinFilter::LinearMipmapNearest),
+        };
+        json::Index::push(&mut self.root.samplers, json::texture::Sampler {
+            mag_filter: Some(Checked::Valid(mag)), min_filter: Some(Checked::Valid(min)),
+            name: texture.name().map(|name| format!("{name}_Sampler")),
+            wrap_s: Checked::Valid(wrap("m_WrapU")), wrap_t: Checked::Valid(wrap("m_WrapV")),
+            extensions: None, extras: Default::default(),
+        })
     }
 
     fn ensure_default_sampler(&mut self) -> json::Index<json::texture::Sampler> {

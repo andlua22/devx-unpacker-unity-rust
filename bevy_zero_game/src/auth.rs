@@ -23,33 +23,21 @@ pub enum LoginOutcome {
 pub struct AuthMgr {
     pub account: String,
     pub session_key: String,
+    pub server_id: u32,
     pub is_auth: bool,
 }
 
 impl AuthMgr {
     pub fn set_auth(&mut self, account: &str, session_key: &str) {
-        self.account = account.trim().to_owned();
+        self.account = account.to_owned();
         self.session_key = session_key.to_owned();
-        self.is_auth = !self.account.is_empty();
+        self.is_auth = !self.session_key.is_empty();
     }
 
     pub fn cancel_auth(&mut self) {
         self.is_auth = false;
+        self.account.clear();
         self.session_key.clear();
-    }
-
-    /// Mirrors `LoginAccoutPanel.<onInit>b__6_0`: prepends `account` to the persisted
-    /// `dev_Accounts` list without duplicates.
-    pub fn record_dev_account(dev_accounts: &mut Vec<String>, account: &str) {
-        let trimmed = account.trim();
-        if trimmed.is_empty() {
-            return;
-        }
-        dev_accounts.retain(|a| !a.eq_ignore_ascii_case(trimmed));
-        dev_accounts.insert(0, trimmed.to_owned());
-        if dev_accounts.len() > 8 {
-            dev_accounts.truncate(8);
-        }
     }
 }
 
@@ -58,32 +46,45 @@ impl AuthMgr {
 pub struct PlatformMgr {
     /// `0` = account/test login, anything else would route through a platform SDK.
     pub platform: i32,
+    /// Independent native flag (`PlatformMgr.UseSdk`), set by platform initialization.
+    #[allow(
+        dead_code,
+        reason = "Preserved native SDK state; local account mode has no SDK initialization."
+    )]
+    pub sdk_enabled: bool,
+    /// `PlatformMgr.isCreateRole`: a role was created during this login, not ownership.
     pub is_create_role: bool,
 }
 
 impl PlatformMgr {
+    #[allow(
+        dead_code,
+        reason = "Preserved native SDK interface, verified separately from local account login."
+    )]
     pub fn use_sdk(&self) -> bool {
-        self.platform != 0
+        self.sdk_enabled
     }
 
-    /// `PlatformMgr.Login()` for `mPlatform == 0`. `created_roles` is the persisted set of
-    /// accounts that already finished character creation.
+    /// Account login with the local replacement's account/server ownership lookup.
+    /// The APK supplies this outcome through its server response, not a client-side list.
     pub fn login(
         &mut self,
         auth: &mut AuthMgr,
         account: &str,
         session_key: &str,
-        created_roles: &[String],
+        server_id: u32,
+        has_role: bool,
     ) -> LoginOutcome {
-        if self.use_sdk() {
+        if self.platform != 0 {
             return LoginOutcome::Rejected("SDK login is not available in this client".into());
         }
         if account.trim().is_empty() {
             return LoginOutcome::Rejected("Account is empty".into());
         }
         auth.set_auth(account, session_key);
-        self.is_create_role = created_roles.iter().any(|a| a == &auth.account);
-        if self.is_create_role {
+        auth.server_id = server_id;
+        self.is_create_role = false;
+        if has_role {
             LoginOutcome::LoggedIn
         } else {
             LoginOutcome::NoCreateRole
@@ -91,11 +92,12 @@ impl PlatformMgr {
     }
 
     /// `PlatformMgr.OnCreateRole`.
-    pub fn on_create_role(&mut self, auth: &AuthMgr, created_roles: &mut Vec<String>) {
-        if !auth.account.is_empty() && !created_roles.contains(&auth.account) {
-            created_roles.push(auth.account.clone());
+    pub fn on_create_role(&mut self, auth: &AuthMgr) -> bool {
+        if auth.account.is_empty() {
+            return false;
         }
         self.is_create_role = true;
+        true
     }
 }
 
@@ -104,19 +106,20 @@ pub const NAME_ERR_EMPTY: i32 = 132;
 pub const NAME_ERR_SPECIAL: i32 = 131;
 pub const NAME_ERR_LENGTH: i32 = 255;
 
+// EstablishPanel.REGEX_STRING, observed in the native constructor at RVA 0x16D46D4.
+pub const SPECIAL_NAME_CHARACTERS: &str =
+    " `~!@#$%^&*()+=|{}':;',[].<>/?~！@#￥%&*（）——+|{}【】‘；：”“’。，、？\"‥…▪•";
+
 /// Returns the localization string id of the first violated rule, or `None` when valid.
 pub fn check_name(name: &str) -> Option<i32> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
+    if name.is_empty() {
         return Some(NAME_ERR_EMPTY);
     }
-    if trimmed
-        .chars()
-        .any(|c| !(c.is_alphanumeric() || c == '_' || c == '-'))
-    {
+    if name.chars().any(|c| SPECIAL_NAME_CHARACTERS.contains(c)) {
         return Some(NAME_ERR_SPECIAL);
     }
-    if trimmed.chars().count() <= 1 {
+    // OnClickOk uses System.String.Length, which counts UTF-16 code units.
+    if name.encode_utf16().count() <= 1 {
         return Some(NAME_ERR_LENGTH);
     }
     None
@@ -130,15 +133,14 @@ mod tests {
     fn new_account_routes_to_role_creation_then_lobby() {
         let mut auth = AuthMgr::default();
         let mut plat = PlatformMgr::default();
-        let mut roles = Vec::new();
         assert_eq!(
-            plat.login(&mut auth, "Andlua", "", &roles),
+            plat.login(&mut auth, "Andlua", "", 5, false),
             LoginOutcome::NoCreateRole
         );
-        assert!(auth.is_auth);
-        plat.on_create_role(&auth, &mut roles);
+        assert!(!auth.is_auth);
+        assert!(plat.on_create_role(&auth));
         assert_eq!(
-            plat.login(&mut auth, "Andlua", "", &roles),
+            plat.login(&mut auth, "Andlua", "", 5, true),
             LoginOutcome::LoggedIn
         );
     }
@@ -147,9 +149,15 @@ mod tests {
     fn empty_account_and_sdk_are_rejected() {
         let mut auth = AuthMgr::default();
         let mut plat = PlatformMgr::default();
-        assert!(matches!(plat.login(&mut auth, "  ", "", &[]), LoginOutcome::Rejected(_)));
+        assert!(matches!(
+            plat.login(&mut auth, "  ", "", 5, false),
+            LoginOutcome::Rejected(_)
+        ));
         plat.platform = 3;
-        assert!(matches!(plat.login(&mut auth, "a", "", &[]), LoginOutcome::Rejected(_)));
+        assert!(matches!(
+            plat.login(&mut auth, "a", "", 5, false),
+            LoginOutcome::Rejected(_)
+        ));
     }
 
     #[test]
@@ -159,8 +167,58 @@ mod tests {
         assert_eq!(check_name("a"), Some(NAME_ERR_LENGTH));
         assert_eq!(check_name("Builder_UA"), None);
         assert_eq!(check_name("亚历山大"), None);
-        let mut accounts = vec!["Alpha".to_owned(), "Beta".to_owned()];
-        AuthMgr::record_dev_account(&mut accounts, "beta");
-        assert_eq!(accounts, vec!["beta".to_owned(), "Alpha".to_owned()]);
+        assert_eq!(check_name("Two Words"), Some(NAME_ERR_SPECIAL));
+        assert_eq!(check_name("\t\t"), None);
+        assert_eq!(check_name("🧑"), None);
+    }
+
+    #[test]
+    fn unauthenticated_role_completion_is_rejected() {
+        let mut plat = PlatformMgr::default();
+        assert!(!plat.on_create_role(&AuthMgr::default()));
+        assert!(!plat.is_create_role);
+    }
+
+    #[test]
+    fn auth_uses_native_session_key_semantics_and_cancel_clears_identity() {
+        let mut auth = AuthMgr::default();
+        auth.set_auth("  Account  ", "");
+        assert_eq!(auth.account, "  Account  ");
+        assert!(!auth.is_auth);
+        auth.set_auth("", "session");
+        assert!(auth.is_auth);
+        auth.cancel_auth();
+        assert!(auth.account.is_empty());
+        assert!(auth.session_key.is_empty());
+        assert!(!auth.is_auth);
+    }
+
+    #[test]
+    fn sdk_flag_and_creation_event_are_independent_of_account_ownership() {
+        let mut auth = AuthMgr::default();
+        let mut plat = PlatformMgr {
+            sdk_enabled: true,
+            ..Default::default()
+        };
+        assert!(plat.use_sdk());
+        assert_eq!(
+            plat.login(&mut auth, "Account", "session", 10, true),
+            LoginOutcome::LoggedIn
+        );
+        assert!(!plat.is_create_role);
+        assert!(plat.on_create_role(&auth));
+        assert!(plat.is_create_role);
+        assert_eq!(
+            plat.login(&mut auth, "Account", "session", 10, true),
+            LoginOutcome::LoggedIn
+        );
+        assert!(!plat.is_create_role);
+        plat.platform = 3;
+        plat.sdk_enabled = false;
+        assert!(!plat.use_sdk());
+        assert!(matches!(
+            plat.login(&mut auth, "Account", "session", 10, true),
+            LoginOutcome::Rejected(_)
+        ));
     }
 }

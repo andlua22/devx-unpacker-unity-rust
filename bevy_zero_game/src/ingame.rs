@@ -20,10 +20,13 @@ use bevy::ui_widgets::Button;
 
 use crate::actor_rig::{
     AnimState, BoundActorRole, BoundAnimationSet, CharacterAnimDriver, UsesBakedGltfAnim,
-    animate_bip001_rigs, build_gltf_animation_set, find_hand_socket_entity, gunshot_audio_for_prop,
-    pick_clip_for_state, select_weapon_prop, spawn_modular_character,
+    animate_bip001_rigs, apply_character_skin_and_hair_tints, bind_native_character_animations,
+    bind_rigid_character_hair, build_gltf_animation_set, drive_native_character_animations,
+    find_hand_socket_entity, gunshot_audio_for_prop, retarget_native_character_parts,
+    pick_clip_for_state, select_weapon_prop, spawn_modular_character_from_profile,
 };
-use crate::config::{AssetManifest, BaseSaveData, KeybindProfile, PlayerProfileSave};
+use crate::battle::BattleLoadingSet;
+use crate::config::{AssetManifest, BaseSaveData, GameConfigs, KeybindProfile, PlayerProfileSave};
 use crate::net::protocol::{
     MAX_PLAYERS, NetPlayerState, OP_CONSUME_BANDAGE, OP_ENTER_EXIT_VEHICLE, OP_HARVEST_NODE,
     OP_HIT_ENEMY, OP_HIT_PLAYER, OP_LOOT_DROP, OP_PLACE_BUILD, OP_REFUEL_OR_TOGGLE_POWER,
@@ -43,7 +46,7 @@ const CHUNK_STREAM_OUT_RADIUS: f32 = 760.0;
 const NODE_RENDER_RADIUS: f32 = 220.0;
 
 #[derive(Component)]
-struct LocalArenaAvatar;
+pub(crate) struct LocalArenaAvatar;
 
 #[derive(Component)]
 struct LocalArenaWeaponMount {
@@ -51,7 +54,7 @@ struct LocalArenaWeaponMount {
 }
 
 #[derive(Component)]
-struct ArenaFollowCamera {
+pub(crate) struct ArenaFollowCamera {
     yaw: f32,
     pitch: f32,
     radius: f32,
@@ -146,8 +149,31 @@ pub struct InGamePlugin;
 impl Plugin for InGamePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SurvivalSessionState>()
-            .add_systems(OnEnter(AppState::InGame), enter_ingame_arena)
+            .add_systems(OnEnter(AppState::LoadingScene), enter_ingame_arena)
+            .add_systems(OnEnter(AppState::InGame), start_battle_play)
             .add_systems(OnExit(AppState::InGame), exit_ingame_arena)
+            .add_systems(OnEnter(AppState::MainLobby), (
+                crate::states::despawn_roots_with::<InGameRoot>, cleanup_arena_resources,
+            ))
+            .add_systems(OnEnter(AppState::LoginLobby), (
+                crate::states::despawn_roots_with::<InGameRoot>, cleanup_arena_resources,
+            ))
+            .add_systems(Update, (
+                stream_terrain_chunks_system,
+                sync_resource_nodes_system,
+                sync_replicated_structures_system,
+                sync_replicated_enemies_system,
+                bind_and_drive_enemy_anims_system,
+                sync_replicated_loot_drops_system,
+                sync_replicated_vehicles_system,
+                sync_ingame_weapon_socket,
+                reconcile_local_avatar_system,
+                bind_native_character_animations,
+                retarget_native_character_parts,
+                bind_rigid_character_hair,
+                apply_character_skin_and_hair_tints,
+            ).chain().in_set(BattleLoadingSet::PrepareWorld)
+                .run_if(in_state(AppState::LoadingScene)))
             .add_systems(
                 Update,
                 (
@@ -162,6 +188,11 @@ impl Plugin for InGamePlugin {
                     sync_ingame_weapon_socket,
                     reconcile_local_avatar_system,
                     replicate_remote_peers_system,
+                    bind_native_character_animations,
+                    retarget_native_character_parts,
+                    bind_rigid_character_hair,
+                    drive_native_character_animations,
+                    apply_character_skin_and_hair_tints,
                     animate_bip001_rigs,
                     update_build_ghost_and_tracers,
                     arena_camera_controller_system,
@@ -176,6 +207,9 @@ impl Plugin for InGamePlugin {
 struct ArenaEnterCtx<'w> {
     manifest: Res<'w, AssetManifest>,
     profile: Res<'w, PlayerProfileSave>,
+    configs: Res<'w, GameConfigs>,
+    war_choice: Res<'w, crate::war_choice::WarChoiceState>,
+    client: Res<'w, NetClientState>,
     asset_server: Res<'w, AssetServer>,
     survival: ResMut<'w, SurvivalSessionState>,
     meshes: ResMut<'w, Assets<Mesh>>,
@@ -185,15 +219,34 @@ struct ArenaEnterCtx<'w> {
 
 fn enter_ingame_arena(mut commands: Commands, mut ctx: ArenaEnterCtx) {
     *ctx.survival = SurvivalSessionState::default();
+    if let Some(battle) = &ctx.war_choice.selected_battle {
+        ctx.survival.craft_mode = match battle.game_mode {
+            13 | 14 => crate::crafting::CraftMode::Civilization,
+            15 | 16 => crate::crafting::CraftMode::Firepower,
+            18 => crate::crafting::CraftMode::Nostalgia,
+            _ => crate::crafting::CraftMode::Island,
+        };
+        ctx.survival.battle_mode = if battle.game_mode == 9 { 9 } else { 0 };
+    }
     if let Some(ref mut srv) = ctx.server_opt
         && srv.world.structures.is_empty()
-        && let Some(saved) = BaseSaveData::load_from_disk(&BaseSaveData::resolve_save_path())
+        && let Some(saved) = BaseSaveData::load_from_disk(
+            &srv.world
+                .saved_base_path(ctx.client.local_player_id.unwrap_or(1)),
+        )
     {
-        srv.world.import_saved_base(&saved);
-        ctx.survival.status_banner = format!(
-            "Restored saved base ({} buildings)",
-            saved.structures.len()
-        );
+        let expected_owner = crate::config::LocalRoleKey {
+            account_name: ctx.profile.account_name.clone(),
+            server_id: srv.world.storage_server_id,
+        };
+        ctx.survival.status_banner = if saved.owner_key.as_ref() != Some(&expected_owner) {
+            "Saved base owner does not match the active account/server".to_owned()
+        } else {
+            match srv.world.import_saved_base(&saved) {
+                Ok(()) => format!("Restored saved base ({} buildings)", saved.structures.len()),
+                Err(error) => format!("Base restore failed: {error}"),
+            }
+        };
         ctx.survival.status_banner_secs = 4.0;
     }
     let terrain = TerrainColliderGrid::load_default();
@@ -271,7 +324,11 @@ fn enter_ingame_arena(mut commands: Commands, mut ctx: ArenaEnterCtx) {
         yaw: 0.15,
         pitch: 0.22,
         radius: 5.8,
-        focus: Vec3::new(0.42 * 0.15_f32.cos(), spawn_ground + 1.72, -0.42 * 0.15_f32.sin()),
+        focus: Vec3::new(
+            0.42 * 0.15_f32.cos(),
+            spawn_ground + 1.72,
+            -0.42 * 0.15_f32.sin(),
+        ),
     };
     commands.spawn((
         InGameRoot,
@@ -279,6 +336,7 @@ fn enter_ingame_arena(mut commands: Commands, mut ctx: ArenaEnterCtx) {
         Camera3d::default(),
         SpatialListener::new(1.8),
         Camera {
+            order: -1,
             clear_color: ClearColorConfig::Custom(Color::srgb(0.46, 0.72, 0.94)),
             ..default()
         },
@@ -338,16 +396,6 @@ fn enter_ingame_arena(mut commands: Commands, mut ctx: ArenaEnterCtx) {
         Transform::from_xyz(0.0, spawn_ground, 0.0),
     ));
 
-    // Ambient world wind/theme soundtrack looping quietly in background
-    if ctx.profile.music_volume > 0.01 {
-        commands.spawn((
-            InGameRoot,
-            DespawnOnExit(AppState::InGame),
-            AudioPlayer::new(ctx.asset_server.load("audio/bgm_wenmingchongqi.wav")),
-            PlaybackSettings::LOOP.with_volume(Volume::Linear(ctx.profile.music_volume * 0.28)),
-        ));
-    }
-
     // Customized modular survivor avatar (`PlayerProfileSave`): body + head + gloves + shoes + hair.
     commands
         .spawn((
@@ -360,20 +408,36 @@ fn enter_ingame_arena(mut commands: Commands, mut ctx: ArenaEnterCtx) {
             Transform::from_xyz(0.0, spawn_ground, 0.0),
         ))
         .with_children(|parent| {
-            spawn_modular_character(
+            spawn_modular_character_from_profile(
                 parent,
                 &ctx.asset_server,
                 &ctx.manifest,
-                ctx.profile.sex_male,
-                ctx.profile.body_variant_idx,
-                ctx.profile.head_variant_idx,
-                ctx.profile.hair_variant_idx,
+                &ctx.configs,
+                &ctx.profile,
             );
         });
 }
 
-fn exit_ingame_arena(mut commands: Commands, mut client: ResMut<NetClientState>) {
+fn start_battle_play(
+    mut commands: Commands,
+    mut cameras: Query<&mut Camera, With<ArenaFollowCamera>>,
+    profile: Res<PlayerProfileSave>,
+    asset_server: Res<AssetServer>,
+) {
+    for mut camera in &mut cameras { camera.order = 0; }
+    if profile.music_volume > 0.01 {
+        commands.spawn((InGameRoot, DespawnOnExit(AppState::InGame),
+            AudioPlayer::new(asset_server.load("audio/bgm_wenmingchongqi.wav")),
+            PlaybackSettings::LOOP.with_volume(Volume::Linear(profile.music_volume * 0.28))));
+    }
+}
+
+fn exit_ingame_arena(commands: Commands, mut client: ResMut<NetClientState>) {
     client.disconnect();
+    cleanup_arena_resources(commands);
+}
+
+fn cleanup_arena_resources(mut commands: Commands) {
     commands.remove_resource::<ArenaSharedAssets>();
     commands.remove_resource::<TerrainColliderGrid>();
 }
@@ -456,7 +520,7 @@ fn handle_ingame_hotkeys_and_actions(
     {
         let owner = ctx.client.local_player_id.unwrap_or(1);
         let save = srv.world.export_saved_base(owner);
-        ctx.survival.status_banner = match save.save_atomic(&BaseSaveData::resolve_save_path()) {
+        ctx.survival.status_banner = match save.save_atomic(&srv.world.saved_base_path(owner)) {
             Ok(()) => format!("Saved base ({} structures)", save.structures.len()),
             Err(e) => format!("Base save failed: {e}"),
         };
@@ -560,7 +624,8 @@ fn handle_ingame_hotkeys_and_actions(
 
     let sprinting = ctx.keys.pressed(KeyCode::ShiftLeft) || ctx.keys.pressed(KeyCode::ShiftRight);
     let mut buttons = 0_u16;
-    if ctx.mouse_btn.pressed(MouseButton::Left) && !ctx.survival.craft_menu_open && !any_ui_hovered {
+    if ctx.mouse_btn.pressed(MouseButton::Left) && !ctx.survival.craft_menu_open && !any_ui_hovered
+    {
         buttons |= 1;
     }
     if sprinting {
@@ -591,8 +656,8 @@ fn handle_ingame_hotkeys_and_actions(
                 buttons |= 4;
             }
         }
-        ctx.survival.active_vehicle_speed = (throttle.abs() * dv.kind.max_speed())
-            * if sprinting { 1.32 } else { 1.0 };
+        ctx.survival.active_vehicle_speed =
+            (throttle.abs() * dv.kind.max_speed()) * if sprinting { 1.32 } else { 1.0 };
         (Vec2::new(steer, throttle), dv.yaw)
     } else {
         let mut wish = Vec3::ZERO;
@@ -636,7 +701,11 @@ fn handle_ingame_hotkeys_and_actions(
         driver.state = if ctx.survival.attack_cooldown > 0.08 {
             AnimState::Attack
         } else if wish_xz.length_squared() > 0.01 {
-            if sprinting { AnimState::Run } else { AnimState::Walk }
+            if sprinting {
+                AnimState::Run
+            } else {
+                AnimState::Walk
+            }
         } else {
             AnimState::Idle
         };
@@ -698,9 +767,7 @@ fn handle_ingame_hotkeys_and_actions(
         .structures
         .values()
         .filter(|s| {
-            s.kind == BuildPieceKind::Generator
-                && s.hp > 0
-                && s.pos.distance(player_pos) <= 6.5
+            s.kind == BuildPieceKind::Generator && s.hp > 0 && s.pos.distance(player_pos) <= 6.5
         })
         .min_by(|a, b| {
             a.pos
@@ -721,13 +788,8 @@ fn handle_ingame_hotkeys_and_actions(
                 ctx.profile.sfx_volume * 0.85,
             );
         } else if let Some(ref veh) = near_vehicle {
-            ctx.client.send_world_op(
-                OP_ENTER_EXIT_VEHICLE,
-                u32::from(veh.id),
-                0,
-                0,
-                Vec3::ZERO,
-            );
+            ctx.client
+                .send_world_op(OP_ENTER_EXIT_VEHICLE, u32::from(veh.id), 0, 0, Vec3::ZERO);
             play_sfx(
                 &mut commands,
                 &ctx.asset_server,
@@ -755,13 +817,8 @@ fn handle_ingame_hotkeys_and_actions(
                 ctx.profile.sfx_volume * 0.85,
             );
         } else if let Some(ref gen_st) = near_gen {
-            ctx.client.send_world_op(
-                OP_REFUEL_OR_TOGGLE_POWER,
-                gen_st.id,
-                0,
-                0,
-                Vec3::ZERO,
-            );
+            ctx.client
+                .send_world_op(OP_REFUEL_OR_TOGGLE_POWER, gen_st.id, 0, 0, Vec3::ZERO);
             play_sfx(
                 &mut commands,
                 &ctx.asset_server,
@@ -867,7 +924,11 @@ fn handle_ingame_hotkeys_and_actions(
             format!(
                 "Driving {} | [W/S] Drive [A/D] Steer [Shift] Boost [LMB] {} [{interact_lbl}] Exit",
                 dv.kind.label(),
-                if dv.kind == VehicleKind::ArmoredTank { "Cannon" } else { "Horn" }
+                if dv.kind == VehicleKind::ArmoredTank {
+                    "Cannon"
+                } else {
+                    "Horn"
+                }
             )
         };
         if ctx.mouse_btn.just_pressed(MouseButton::Left)
@@ -885,9 +946,18 @@ fn handle_ingame_hotkeys_and_actions(
                 );
             } else {
                 let muzzle = dv.pos + Vec3::Y * 1.8;
-                let end = hit.map(|h| h.point).unwrap_or(muzzle + cam_tf.forward() * 65.0);
+                let end = hit
+                    .map(|h| h.point)
+                    .unwrap_or(muzzle + cam_tf.forward() * 65.0);
                 spawn_tracer_beam(&mut commands, shared, muzzle, end);
-                spawn_particle_burst(&mut commands, shared, end, 10, 5.5, shared.spark_mat.clone());
+                spawn_particle_burst(
+                    &mut commands,
+                    shared,
+                    end,
+                    10,
+                    5.5,
+                    shared.spark_mat.clone(),
+                );
                 play_sfx(
                     &mut commands,
                     &ctx.asset_server,
@@ -992,7 +1062,11 @@ fn handle_ingame_hotkeys_and_actions(
             } else if let Some(ref gen_st) = near_gen {
                 format!(
                     "[{interact_lbl}] {} Generator (Grid {}%)",
-                    if gen_st.is_open { "Toggle/Refuel" } else { "Start/Refuel" },
+                    if gen_st.is_open {
+                        "Toggle/Refuel"
+                    } else {
+                        "Start/Refuel"
+                    },
                     ctx.client.base_power_pct
                 )
             } else {
@@ -1070,14 +1144,20 @@ fn handle_ingame_hotkeys_and_actions(
                     _ => 0_u8,
                 };
                 if is_rifle {
-                    ctx.client
-                        .send_world_op(OP_SPEND_AMMO, 0, 0, 0, Vec3::ZERO);
+                    ctx.client.send_world_op(OP_SPEND_AMMO, 0, 0, 0, Vec3::ZERO);
                     let start = player_pos + Vec3::new(0.0, 1.45, 0.0) + cam_right * 0.25;
                     let end = hit
                         .map(|h| h.point)
                         .unwrap_or(ray_origin + *cam_tf.forward() * 65.0);
                     spawn_tracer_beam(&mut commands, shared, start, end);
-                    spawn_particle_burst(&mut commands, shared, start, 5, 3.0, shared.spark_mat.clone());
+                    spawn_particle_burst(
+                        &mut commands,
+                        shared,
+                        start,
+                        5,
+                        3.0,
+                        shared.spark_mat.clone(),
+                    );
                     let want_prop = ctx
                         .survival
                         .equipped_prop_override
@@ -1119,7 +1199,12 @@ fn handle_ingame_hotkeys_and_actions(
                                     _ => "audio/gunattack_mutou.wav",
                                 })
                                 .unwrap_or("audio/gunattack_mutou.wav");
-                            play_sfx(&mut commands, &ctx.asset_server, sfx, ctx.profile.sfx_volume * 0.85);
+                            play_sfx(
+                                &mut commands,
+                                &ctx.asset_server,
+                                sfx,
+                                ctx.profile.sfx_volume * 0.85,
+                            );
                             spawn_particle_burst(
                                 &mut commands,
                                 shared,
@@ -1383,7 +1468,14 @@ fn sync_replicated_structures_system(
             vis_meta.is_open = true;
             let gen_pos = rep.pos + Vec3::new(0.0, 1.1, 0.0);
             if let Some(shared) = ctx.shared_opt.as_deref() {
-                spawn_particle_burst(&mut commands, shared, gen_pos, 5, 2.8, shared.electric_mat.clone());
+                spawn_particle_burst(
+                    &mut commands,
+                    shared,
+                    gen_pos,
+                    5,
+                    2.8,
+                    shared.electric_mat.clone(),
+                );
             }
             play_spatial_sfx(
                 &mut commands,
@@ -1402,8 +1494,7 @@ fn sync_replicated_structures_system(
         if !matches!(
             rep.kind,
             BuildPieceKind::Turret | BuildPieceKind::ElectricTurret
-        )
-            && has_children
+        ) && has_children
             && (!vis_meta.synced || vis_meta.tier != rep.tier || vis_meta.is_open != rep.is_open)
         {
             vis_meta.tier = rep.tier;
@@ -1461,7 +1552,12 @@ fn sync_replicated_vehicles_system(
     profile: Res<PlayerProfileSave>,
     client: Res<NetClientState>,
     shared_opt: Option<Res<ArenaSharedAssets>>,
-    mut existing_q: Query<(Entity, &mut SpawnedVehicleVisual, &mut Transform, Option<&Children>)>,
+    mut existing_q: Query<(
+        Entity,
+        &mut SpawnedVehicleVisual,
+        &mut Transform,
+        Option<&Children>,
+    )>,
     children_q: Query<&Children>,
     names_q: Query<&Name>,
     mut part_tf_q: Query<&mut Transform, Without<SpawnedVehicleVisual>>,
@@ -1499,7 +1595,14 @@ fn sync_replicated_vehicles_system(
             if let Some(shared) = shared_opt.as_deref()
                 && !meta.kind.is_aircraft()
             {
-                spawn_particle_burst(&mut commands, shared, rep.pos + Vec3::Y * 0.3, 3, 2.2, shared.chip_mat.clone());
+                spawn_particle_burst(
+                    &mut commands,
+                    shared,
+                    rep.pos + Vec3::Y * 0.3,
+                    3,
+                    2.2,
+                    shared.chip_mat.clone(),
+                );
             }
         }
         meta.was_driven = is_driven;
@@ -1606,7 +1709,11 @@ fn sync_replicated_enemies_system(
         meta.was_dead = dead;
         meta.was_attacking = rep.is_attacking;
 
-        *vis = if dead { Visibility::Hidden } else { Visibility::Inherited };
+        *vis = if dead {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
         tf.translation = tf.translation.lerp(rep.pos, alpha);
         tf.rotation = tf.rotation.slerp(Quat::from_rotation_y(rep.yaw), alpha);
         driver.has_weapon = false;
@@ -1633,7 +1740,11 @@ fn sync_replicated_enemies_system(
             .unwrap_or_else(|| format!("models/{stem}.glb"));
         let scene_h: Handle<WorldAsset> = asset_server.load(format!("{asset_path}#Scene0"));
         let gltf_h: Handle<Gltf> = asset_server.load(asset_path);
-        let scale = if rep.kind == EnemyKind::PortBrute { 1.15 } else { 1.0 };
+        let scale = if rep.kind == EnemyKind::PortBrute {
+            1.15
+        } else {
+            1.0
+        };
         let mut ec = commands.spawn((
             InGameRoot,
             DespawnOnExit(AppState::InGame),
@@ -1712,7 +1823,11 @@ fn bind_and_drive_enemy_anims_system(
                     && !player.is_playing_animation(clip_node)
                 {
                     transitions
-                        .play(&mut player, clip_node, std::time::Duration::from_millis(180))
+                        .play(
+                            &mut player,
+                            clip_node,
+                            std::time::Duration::from_millis(180),
+                        )
                         .repeat();
                 }
             }
@@ -1773,12 +1888,8 @@ fn sync_replicated_loot_drops_system(
     }
 }
 
-type AvatarWeaponQuery<'w, 's> = Query<
-    'w,
-    's,
-    (Entity, Option<&'static Children>),
-    With<LocalArenaAvatar>,
->;
+type AvatarWeaponQuery<'w, 's> =
+    Query<'w, 's, (Entity, Option<&'static Children>), With<LocalArenaAvatar>>;
 
 #[derive(SystemParam)]
 struct WeaponSocketCtx<'w> {
@@ -1845,7 +1956,11 @@ fn update_build_ghost_and_tracers(
     survival: Res<SurvivalSessionState>,
     shared_opt: Option<Res<ArenaSharedAssets>>,
     mut ghost_q: Query<
-        (&mut Transform, &mut Visibility, &mut MeshMaterial3d<StandardMaterial>),
+        (
+            &mut Transform,
+            &mut Visibility,
+            &mut MeshMaterial3d<StandardMaterial>,
+        ),
         With<BuildGhostPreview>,
     >,
     mut tracer_q: Query<(Entity, &mut TracerFx)>,
@@ -2058,13 +2173,16 @@ fn arena_camera_controller_system(
     *tf = Transform::from_translation(cam_pos).looking_at(rig.focus, Vec3::Y);
 }
 
-fn spawn_tracer_beam(
-    commands: &mut Commands,
-    shared: &ArenaSharedAssets,
-    start: Vec3,
-    end: Vec3,
-) {
-    spawn_colored_beam(commands, shared, start, end, shared.tracer_mat.clone(), 1.0, 0.08);
+fn spawn_tracer_beam(commands: &mut Commands, shared: &ArenaSharedAssets, start: Vec3, end: Vec3) {
+    spawn_colored_beam(
+        commands,
+        shared,
+        start,
+        end,
+        shared.tracer_mat.clone(),
+        1.0,
+        0.08,
+    );
 }
 
 fn spawn_colored_beam(
@@ -2104,7 +2222,11 @@ fn spawn_particle_burst(
     for i in 0..count {
         let theta = (i as f32 / count.max(1) as f32) * std::f32::consts::TAU;
         let elev = 0.55 + ((i * 37) % 10) as f32 * 0.08;
-        let vel = Vec3::new(theta.cos() * speed * 0.65, elev * speed, theta.sin() * speed * 0.65);
+        let vel = Vec3::new(
+            theta.cos() * speed * 0.65,
+            elev * speed,
+            theta.sin() * speed * 0.65,
+        );
         commands.spawn((
             InGameRoot,
             DespawnOnExit(AppState::InGame),
@@ -2120,12 +2242,7 @@ fn spawn_particle_burst(
     }
 }
 
-fn play_sfx(
-    commands: &mut Commands,
-    asset_server: &AssetServer,
-    rel_path: &str,
-    volume: f32,
-) {
+fn play_sfx(commands: &mut Commands, asset_server: &AssetServer, rel_path: &str, volume: f32) {
     commands.spawn((
         InGameRoot,
         DespawnOnExit(AppState::InGame),

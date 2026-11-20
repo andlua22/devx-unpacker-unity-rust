@@ -1,0 +1,151 @@
+L0_1:
+v50 = this;
+if ((*(byte*)(0x4902000 +3429) & 1) == 0)
+{
+	L1_1:
+	v51 = IL2CPP_InitMetadata(*(nint*)(0x45f5000 +1936));
+	*(byte*)(0x4902000 +3429) = 1;
+	v50 = v51;
+}
+L0:
+if (this.<>1__state == 1)
+{
+	L1:
+	*(int*)(this.<curInfo>5__3 -32) = -1;
+	instance = v50;
+	instance2 = in_x1;
+	instance3 = in_x2;
+	if (this.<curInfo>5__3 == 0) return v147;
+	L9:
+	this.<curInfo>5__3.createNum = this.<curInfo>5__3.createNum - 1;
+	instance = v50;
+	instance2 = in_x1;
+	instance3 = in_x2;
+	if (this.<createInfo>5__4 == 0) return v147;
+	L10:
+	instance = v50;
+	instance2 = in_x1;
+	instance3 = in_x2;
+	if (this.<>4__this == 0) return v147;
+	L11:
+	this.<>4__this.AddItemToBag(this.<createInfo>5__4.targetItemId, this.<createInfo>5__4.productNum);
+	instance = this.<>4__this.AddItemToBag(this.<createInfo>5__4.targetItemId, this.<createInfo>5__4.productNum);
+	instance2 = this.<createInfo>5__4.targetItemId;
+	instance3 = this.<createInfo>5__4.productNum;
+	if (*(nint*)(this.<curInfo>5__3) == 0) return v147;
+	L12:
+	instance4 = this.<createInfo>5__4.targetItemId;
+	instance5 = this.<createInfo>5__4.productNum;
+	if (*(nint*)(*(nint*)(this.<curInfo>5__3) +20) <= 0)
+	{
+		L13:
+		instance = this.<createInfos>5__2;
+		instance2 = this.<createInfo>5__4.targetItemId;
+		instance3 = this.<createInfo>5__4.productNum;
+		if (this.<createInfos>5__2 != 0)
+		{
+			L14:
+			this.<createInfos>5__2.RemoveAt(0);
+			v96 = this.<>4__this._createList;
+			instance = v96;
+			instance2 = 0;
+			instance3 = *(nint*)(*(nint*)(0x45bf000 +704));
+			if (v96 != 0)
+			{
+				L15:
+				v96.handle();
+				instance4 = *(nint*)(*(nint*)(v96) +480);
+				instance5 = *(nint*)(*(nint*)(0x45bf000 +704));
+				goto L2;
+			}
+		}
+		goto L7;
+	}
+	L2:
+	*(nint*)(this.<curInfo>5__3) = 0;
+	*(nint*)(this.<curInfo>5__3 +8) = 0;
+	v20 = this.<createInfos>5__2;
+	instance = this.<createInfos>5__2;
+	instance2 = instance4;
+	instance3 = instance5;
+	if (this.<createInfos>5__2 != 0)
+	{
+		L3:
+		if (*(nint*)(v20 +24) <= 0)
+		{
+			L5:
+			this.<>4__this._mCreateCoroutine = 0;
+			v21 = 0;
+		} else {
+			L18:
+			v115 = v20.get_Item(0);
+			this.<curInfo>5__3 = v115;
+			instance = v115;
+			instance2 = 0;
+			instance3 = *(nint*)(*(nint*)(0x45fe000 +1376));
+			if (v115 == 0) return v147;
+			L19:
+			v122 = DrawingCfg.Get(*(nint*)(v115 +16));
+			this.<createInfo>5__4 = v122;
+			instance = v122;
+			instance2 = 0;
+			instance3 = *(nint*)(*(nint*)(0x45fe000 +1376));
+			if (v122 == 0)
+			{
+				L7:
+				v147 = IL2CPP_RaiseException(instance);
+				return v147;
+			} else {
+				L20:
+				v140 = Utils.WaitForSeconds(__abi);
+				this.<>2__current = v140;
+				this.<>1__state = 1;
+				v21 = 1;
+				L6:
+				return v21;
+			}
+			goto L7;
+		}
+		return v21;
+	}
+} else {
+	L3_1:
+	if (this.<>1__state != 0)
+	{
+		L4:
+		v21 = 0;
+		return v21;
+	} else {
+		L4_1:
+		this.<>1__state = -1;
+		instance = v50;
+		instance2 = in_x1;
+		instance3 = in_x2;
+		if (this.<>4__this != 0)
+		{
+			L5_1:
+			v61 = this.<>4__this._createList;
+			instance = v61;
+			instance2 = in_x1;
+			instance3 = in_x2;
+			if (v61 != 0)
+			{
+				L6_1:
+				this.<createInfos>5__2 = v61.ceateInfos;
+				v20 = v61.ceateInfos;
+				if (v61.ceateInfos != 0)
+				{
+					goto L3;
+				} else {
+					L7_1:
+					instance = v61.ceateInfos;
+					instance2 = in_x1;
+					instance3 = in_x2;
+					return v147;
+				}
+			}
+		}
+		goto L7;
+	}
+}
+return v147;

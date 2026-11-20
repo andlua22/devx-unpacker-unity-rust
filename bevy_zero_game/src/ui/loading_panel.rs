@@ -19,8 +19,8 @@ use bevy::ui_widgets::{Activate, Button, observe};
 use crate::config::{ConfigLoadProgress, GameConfigs, LocalizationDb};
 use crate::states::{AppState, SplashUiRoot};
 use crate::ui::panel_loader::{
-    BoundUiClick, BoundUiPanel, UiPanelDoc, UiPanelFrame, UiPaletteButton,
-    UiRetainedOptions, apply_panel_default_view_rules, compute_panel_fit_scale, load_ui_panel_doc,
+    BoundUiClick, BoundUiPanel, UiPaletteButton, UiPanelDoc, UiPanelFrame, UiRetainedOptions,
+    apply_panel_default_view_rules, compute_panel_fit_scale, load_ui_panel_doc,
     spawn_fullscreen_backdrop, spawn_retained_panel_into,
 };
 use crate::ui::widgets::UiFilledBar;
@@ -30,6 +30,10 @@ const SLIDER_FILL_HOLD_SECS: f32 = 1.35;
 /// Optional smoke-capture gate keeping `LauncherSplash` alive until `01_splash.png` is captured.
 #[derive(Resource, Default)]
 pub struct SplashCaptureHold(pub bool);
+
+/// Keeps the battle transition visible until its asynchronous smoke screenshot completes.
+#[derive(Resource)]
+pub struct BattleLoadingCaptureHold(pub bool);
 
 /// Execution stage mirroring `LoadingPanel.cs` coroutine & update progression.
 #[allow(dead_code)]
@@ -340,7 +344,8 @@ pub fn spawn_loading_panel_screen(
             commands.entity(main_bg_e).insert(Visibility::Inherited);
         }
         if let Some(bg_e) = controller.m_bg() {
-            let mut img = ImageNode::new(asset_server.load(backdrop_asset)).with_color(Color::WHITE);
+            let mut img =
+                ImageNode::new(asset_server.load(backdrop_asset)).with_color(Color::WHITE);
             img.image_mode = NodeImageMode::Stretch;
             commands.entity(bg_e).insert(img);
         }
@@ -674,10 +679,7 @@ mod tests {
             format_progress_bytes_label(&cfg, &l10n, 128, 256),
             "0.12K/0.25K"
         );
-        assert_eq!(
-            format_progress_bytes_label(&cfg, &l10n, 0, 0),
-            "Loading..."
-        );
+        assert_eq!(format_progress_bytes_label(&cfg, &l10n, 0, 0), "Loading...");
     }
 
     #[test]

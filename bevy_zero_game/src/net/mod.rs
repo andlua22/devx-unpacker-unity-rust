@@ -1,6 +1,7 @@
 //! Pure-Bevy 100-player networking & spatial replication plugin.
 
 pub mod interest;
+mod inventory;
 pub mod protocol;
 pub mod transport;
 
@@ -256,15 +257,27 @@ mod tests {
         assert_eq!(client.structures.get(&found_id).unwrap().tier, 2);
         assert!(client.structures.get(&door_id).unwrap().is_open);
         assert!(client.damaged_node_hps.contains_key(&1));
-        assert!(!client.enemies.is_empty(), "Phase 4 enemies must replicate in WorldStateSync");
-        assert!(!client.loot_drops.is_empty(), "Phase 4 loot drops must replicate in WorldStateSync");
+        assert!(
+            !client.enemies.is_empty(),
+            "Phase 4 enemies must replicate in WorldStateSync"
+        );
+        assert!(
+            !client.loot_drops.is_empty(),
+            "Phase 4 loot drops must replicate in WorldStateSync"
+        );
 
         // Hit an enemy until dead -> DropSack appears -> Place Auto Turret!
         let enemy_id = *client.enemies.keys().next().unwrap();
         {
             let mut client = app.world_mut().resource_mut::<NetClientState>();
             for _ in 0..4 {
-                client.send_world_op(protocol::OP_HIT_ENEMY, u32::from(enemy_id), 0, 50, Vec3::ZERO);
+                client.send_world_op(
+                    protocol::OP_HIT_ENEMY,
+                    u32::from(enemy_id),
+                    0,
+                    50,
+                    Vec3::ZERO,
+                );
             }
             client.send_world_op(
                 protocol::OP_PLACE_BUILD,
@@ -375,11 +388,7 @@ mod tests {
                 .find(|v| v.kind == crate::world_physics::VehicleKind::OffroadJeep)
                 .unwrap()
                 .id;
-            let start_p = srv
-                .world
-                .players
-                .get_mut(&1)
-                .expect("player 1 must exist");
+            let start_p = srv.world.players.get_mut(&1).expect("player 1 must exist");
             start_p.pos = v_pos + Vec3::new(1.5, 0.0, 0.0);
             j_id
         };
@@ -418,7 +427,9 @@ mod tests {
         let snapshot = srv.world.export_saved_base(1);
         assert_eq!(snapshot.structures.len(), 2);
         let mut fresh = super::transport::ServerWorld::new("Fresh");
-        fresh.import_saved_base(&snapshot);
+        fresh
+            .import_saved_base(&snapshot)
+            .expect("restore saved base");
         assert_eq!(fresh.structures.len(), 2);
     }
 }

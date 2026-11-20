@@ -7,6 +7,7 @@ pub mod login;
 pub mod main_lobby;
 pub mod panel_loader;
 pub mod widgets;
+pub(crate) mod retained_cells;
 
 use bevy::prelude::*;
 
@@ -115,6 +116,7 @@ fn sync_menu_camera_for_state(
             | AppState::PreloadConfigs
             | AppState::LauncherSplash
             | AppState::LoginLobby
+            | AppState::WarChoice
             | AppState::LoadingScene
     );
 

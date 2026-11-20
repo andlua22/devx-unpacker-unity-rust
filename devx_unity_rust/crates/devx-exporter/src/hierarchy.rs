@@ -558,10 +558,15 @@ pub fn discover_hierarchy_groups(
         // Group strictly per enclosing `.ab` archive (before `/CAB-*`) so sibling CAB chunks
         // inside one bundle merge cleanly without contaminating a Prefab (`sceneprefab/*.ab`)
         // with raw untextured FBX dependency meshes (`scenetexture/*.ab`) of the same stem.
-        let bundle_key = loaded
-            .virtual_path
-            .rsplit_once("/CAB-")
-            .map_or_else(|| format!("{}::{stem}", loaded.virtual_path), |(prefix, _)| format!("{prefix}::{stem}"));
+        // Streamed scenes use `BuildPlayer-*.sharedAssets` + `BuildPlayer-*` instead of CAB
+        // names. Both files still belong to one enclosing bundle. Group by that explicit
+        // container identity so raw Mesh roots do not consume a separate export slot and
+        // hide the sibling scene hierarchy with its renderer/material references.
+        let bundle_path = loaded.container_name.as_deref().unwrap_or_else(|| {
+            loaded.virtual_path.rsplit_once("/CAB-")
+                .map_or(loaded.virtual_path.as_str(), |(prefix, _)| prefix)
+        });
+        let bundle_key = format!("{bundle_path}::{stem}");
         grouped
             .entry(bundle_key)
             .and_modify(|g| g.roots.extend(roots.iter().copied()))
@@ -765,6 +770,46 @@ pub(crate) fn sanitize_stem(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streamed_scene_siblings_share_one_group_without_merging_dependency_bundles() {
+        use devx_unity_io::{ContainerKind, LoadedAssetFile};
+        use unity_asset_binary::asset::{ObjectInfo, SerializedFileParser};
+        // Minimal parsed file backing; geometry metadata is enough for hierarchy discovery.
+        let mut metadata = b"2021.3.23f1c1\0".to_vec();
+        metadata.extend_from_slice(&0i32.to_le_bytes());
+        metadata.push(0);
+        for _ in 0..4 { metadata.extend_from_slice(&0i32.to_le_bytes()); }
+        metadata.push(0);
+        let data_offset = 20 + metadata.len();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(metadata.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&((data_offset + 1) as u32).to_be_bytes());
+        bytes.extend_from_slice(&17u32.to_be_bytes());
+        bytes.extend_from_slice(&(data_offset as u32).to_be_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&metadata);
+        bytes.push(0);
+        let mut workspace = UnityWorkspaceData::new(PathBuf::from("game.apk"));
+        for (index, container, member) in [
+            (0, "game.apk/assets/scene/a-57.ab", "BuildPlayer-A-57.sharedAssets"),
+            (1, "game.apk/assets/scene/a-57.ab", "BuildPlayer-A-57"),
+            (2, "game.apk/assets/scenetexture/a-57.ab", "CAB-dependency"),
+        ] {
+            let mut file = SerializedFileParser::from_bytes(bytes.clone()).expect("file");
+            file.objects.push(ObjectInfo::new(1, 0, 0, 43, 0));
+            workspace.files.push(LoadedAssetFile {
+                file_index: index, container_name: Some(container.to_owned()),
+                virtual_path: format!("{container}/{member}"), kind: ContainerKind::AssetBundle,
+                file, raw_bytes: None, bundle_container_paths: Default::default(),
+            });
+        }
+        let groups = discover_hierarchy_groups(&workspace, None);
+        assert_eq!(groups.len(), 2);
+        let scene = groups.iter().find(|g| g.source_bundle.contains("/scene/")).expect("scene");
+        assert_eq!(scene.roots.len(), 2);
+        assert!(scene.roots.iter().all(|r| r.file_index < 2));
+    }
 
     #[test]
     fn derives_clean_bundle_stem() {
